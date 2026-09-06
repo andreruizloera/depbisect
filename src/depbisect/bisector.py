@@ -23,7 +23,11 @@ from dataclasses import dataclass, field
 from depbisect.diffing import ChangedDep
 
 SubsetOracle = Callable[[frozenset[str]], bool]
-VersionOracle = Callable[[str], bool]
+#: A version oracle answers True (passed), False (failed), or None: the
+#: version could not be evaluated here at all, typically because it will
+#: not install on this interpreter or platform. None is not a failure,
+#: and treating it as one is how a bisection blames the wrong release.
+VersionOracle = Callable[[str], bool | None]
 
 
 @dataclass
@@ -102,7 +106,11 @@ class BisectResult:
     last_passing: str
     first_failing: str
     runs: int
-    trace: list[tuple[str, bool]] = field(default_factory=list)
+    trace: list[tuple[str, bool | None]] = field(default_factory=list)
+    #: Versions the oracle could not evaluate that still lie strictly
+    #: inside the reported boundary, so the boundary is not tight and
+    #: the caller must say so.
+    skipped: list[str] = field(default_factory=list)
 
 
 def bisect_versions(path: Sequence[str], oracle: VersionOracle) -> BisectResult:
@@ -112,22 +120,51 @@ def bisect_versions(path: Sequence[str], oracle: VersionOracle) -> BisectResult:
     baseline runs), so only interior candidates cost oracle calls.
     Assumes a single boundary; with flaky tests or multiple boundaries
     the answer is one valid boundary, not necessarily the only one.
+
+    An oracle answering None means "could not tell", not "failed": that
+    candidate is set aside and the nearest usable neighbour is probed
+    instead. Any set-aside version still inside the final interval is
+    returned in ``skipped``, because it is a gap in the evidence. When
+    every remaining candidate is unusable the search stops early and
+    reports the interval it reached, which is never worse than the
+    [good, bad] answer it started from.
     """
     if len(path) < 2:
         raise ValueError("need at least the good and bad versions")
     runs = 0
-    trace: list[tuple[str, bool]] = []
+    trace: list[tuple[str, bool | None]] = []
+    unusable: set[int] = set()
     lo, hi = 0, len(path) - 1
     while hi - lo > 1:
-        mid = (lo + hi) // 2
-        passed = oracle(path[mid])
+        index = _nearest_usable(lo, hi, unusable)
+        if index is None:
+            break
+        verdict = oracle(path[index])
         runs += 1
-        trace.append((path[mid], passed))
-        if passed:
-            lo = mid
+        trace.append((path[index], verdict))
+        if verdict is None:
+            unusable.add(index)
+        elif verdict:
+            lo = index
         else:
-            hi = mid
-    return BisectResult(path[lo], path[hi], runs, trace)
+            hi = index
+    skipped = [path[i] for i in sorted(unusable) if lo < i < hi]
+    return BisectResult(path[lo], path[hi], runs, trace, skipped)
+
+
+def _nearest_usable(lo: int, hi: int, unusable: set[int]) -> int | None:
+    """The candidate closest to the midpoint of (lo, hi) worth probing.
+
+    Walking outward from the midpoint keeps the search logarithmic when
+    nothing is skipped and degrades gently when things are: a run of
+    uninstallable releases costs one probe each, not a whole restart.
+    """
+    mid = (lo + hi) // 2
+    for offset in range(hi - lo):
+        for index in (mid + offset, mid - offset) if offset else (mid,):
+            if lo < index < hi and index not in unusable:
+                return index
+    return None
 
 
 def estimate_runs(n_changed: int, n_candidates: int) -> tuple[int, int]:

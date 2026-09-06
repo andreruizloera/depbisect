@@ -10,6 +10,7 @@ the copy is deleted unless --keep-temp is passed.
 
 from __future__ import annotations
 
+import enum
 import os
 import shutil
 import subprocess
@@ -19,6 +20,16 @@ from pathlib import Path
 
 from depbisect.errors import DepbisectError
 from depbisect.manifests import render_package_json, render_requirements
+
+
+class TrialOutcome(enum.Enum):
+    """What one trial established."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    #: The pins would not install, so the test never ran. Not a failure.
+    UNINSTALLABLE = "uninstallable"
+
 
 _SKIP_DIRS = {
     ".git",
@@ -47,6 +58,7 @@ class Workspace:
         keep: bool = False,
         no_index: bool = False,
         find_links: list[Path] | None = None,
+        index_url: str | None = None,
         timeout: int = 600,
         verbose: bool = False,
     ) -> None:
@@ -55,9 +67,11 @@ class Workspace:
         self.keep = keep
         self.no_index = no_index
         self.find_links = [p.resolve() for p in (find_links or [])]
+        self.index_url = index_url
         self.timeout = timeout
         self.verbose = verbose
         self.root: Path | None = None
+        self.last_install_error: str | None = None
         self._original_package_json: str | None = None
 
     # -- lifecycle -----------------------------------------------------
@@ -82,22 +96,42 @@ class Workspace:
 
     # -- one trial -----------------------------------------------------
 
-    def run_trial(self, pins: dict[str, str], test_cmd: str) -> bool:
+    def try_trial(self, pins: dict[str, str], test_cmd: str) -> TrialOutcome:
         """Install ``pins`` in a fresh env inside the copy, run the test.
 
-        Returns True when the test command exits 0. A combination that
-        fails to install counts as a failing trial (with a warning)
-        rather than aborting the whole search, since conflicting pins
-        are a normal thing to hit mid-bisect.
+        Three outcomes, not two. UNINSTALLABLE means the trial never
+        happened because the pins would not install, which is a
+        different fact from the test failing and must not be collapsed
+        into it: a release that cannot be installed on this interpreter
+        would otherwise be blamed for a regression it has nothing to do
+        with.
         """
         assert self.root is not None, "Workspace must be entered first"
         self._apply(pins)
         try:
             env_dir = self._install(pins)
         except DepbisectError as exc:
-            print(f"warning: trial install failed, counting as FAIL: {exc}", file=sys.stderr)
+            self.last_install_error = str(exc)
+            return TrialOutcome.UNINSTALLABLE
+        self.last_install_error = None
+        return TrialOutcome.PASS if self._run_test(test_cmd, env_dir) else TrialOutcome.FAIL
+
+    def run_trial(self, pins: dict[str, str], test_cmd: str) -> bool:
+        """Two-valued trial, for the subset stage.
+
+        Subset minimization needs a boolean, and a pin combination taken
+        from the project's own manifests that will not install is a real
+        property of that combination, so it counts as a failing trial
+        (with a warning) rather than aborting the search.
+        """
+        outcome = self.try_trial(pins, test_cmd)
+        if outcome is TrialOutcome.UNINSTALLABLE:
+            print(
+                f"warning: trial install failed, counting as FAIL: {self.last_install_error}",
+                file=sys.stderr,
+            )
             return False
-        return self._run_test(test_cmd, env_dir)
+        return outcome is TrialOutcome.PASS
 
     # -- internals -----------------------------------------------------
 
@@ -129,10 +163,19 @@ class Workspace:
         index_args: list[str] = []
         if self.no_index:
             index_args.append("--no-index")
+        elif self.index_url:
+            index_args += ["--index-url", self.index_url]
         for links in self.find_links:
             index_args += ["--find-links", str(links)]
         if uv:
-            self._run([uv, "venv", "--quiet", str(env_dir)], cwd=self.copy_dir, what="uv venv")
+            # --python is explicit so the trial interpreter is the one
+            # depbisect is running under, and therefore the one the
+            # Requires-Python candidate filter was evaluated against.
+            self._run(
+                [uv, "venv", "--quiet", "--python", sys.executable, str(env_dir)],
+                cwd=self.copy_dir,
+                what="uv venv",
+            )
             self._run(
                 [
                     uv,

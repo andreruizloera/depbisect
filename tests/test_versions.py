@@ -9,6 +9,8 @@ from depbisect.versions import (
     compare,
     local_versions,
     parse_version,
+    split_dist_filename,
+    strictly_between,
     version_path,
 )
 
@@ -115,3 +117,49 @@ class TestLocalVersions:
     def test_binary_wheel_tags(self, tmp_path: Path) -> None:
         (tmp_path / "fastpkg-1.2.0-cp313-cp313-macosx_11_0_arm64.whl").write_bytes(b"")
         assert local_versions("fastpkg", [tmp_path]) == ["1.2.0"]
+
+
+class TestSplitDistFilename:
+    @pytest.mark.parametrize(
+        ("filename", "expected"),
+        [
+            ("widget-1.0.0-py3-none-any.whl", ("widget", "1.0.0")),
+            ("widget-1.0.0-cp313-cp313-macosx_11_0_arm64.whl", ("widget", "1.0.0")),
+            ("widget-1.0.0-1-py3-none-any.whl", ("widget", "1.0.0")),  # build tag
+            ("Widget_Thing-2.0-py3-none-any.whl", ("widget-thing", "2.0")),
+            ("widget-1.0.0.tar.gz", ("widget", "1.0.0")),
+            ("some-dashed-name-1.0.0.tar.gz", ("some-dashed-name", "1.0.0")),
+            ("widget-1.0.0.zip", ("widget", "1.0.0")),
+            ("widget-1!2.0.0-py3-none-any.whl", ("widget", "1!2.0.0")),
+        ],
+    )
+    def test_recognized(self, filename: str, expected: tuple[str, str]) -> None:
+        assert split_dist_filename(filename) == expected
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "widget-1.0.0-py3-none-any.whl.asc",  # signature
+            "widget-1.0.0-py3-none.whl",  # too few wheel tags
+            "index.html",
+            "widget.tar.gz",  # no version to split off
+            "",
+        ],
+    )
+    def test_not_a_distribution(self, filename: str) -> None:
+        assert split_dist_filename(filename) is None
+
+
+class TestStrictlyBetween:
+    def test_interior_only(self) -> None:
+        assert strictly_between("1.5.0", "1.0.0", "2.0.0")
+        assert not strictly_between("1.0.0", "1.0.0", "2.0.0")  # endpoints are not interior
+        assert not strictly_between("2.0.0", "1.0.0", "2.0.0")
+        assert not strictly_between("3.0.0", "1.0.0", "2.0.0")
+
+    def test_order_of_the_endpoints_does_not_matter(self) -> None:
+        # A downgrade is still an interval.
+        assert strictly_between("1.5.0", "2.0.0", "1.0.0")
+
+    def test_unparseable_is_not_between_anything(self) -> None:
+        assert not strictly_between("not-a-version", "1.0.0", "2.0.0")

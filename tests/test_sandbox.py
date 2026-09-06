@@ -4,7 +4,8 @@ import hashlib
 import subprocess
 from pathlib import Path
 
-from depbisect.sandbox import TRIAL_REQUIREMENTS, Workspace
+from depbisect.errors import DepbisectError
+from depbisect.sandbox import TRIAL_REQUIREMENTS, TrialOutcome, Workspace
 
 
 def tree_digest(root: Path) -> dict[str, str]:
@@ -194,3 +195,37 @@ def _git(cwd: Path, *args: str) -> None:
             "HOME": str(cwd),
         },
     )
+
+
+class TestTrialOutcome:
+    """An install failure and a test failure are different facts."""
+
+    def test_uninstallable_is_not_a_test_failure(self, tmp_path: Path, monkeypatch) -> None:
+        project = make_project(tmp_path)
+        with Workspace(project, "python") as ws:
+
+            def refuse(pins: dict[str, str]) -> Path:
+                raise DepbisectError("no matching distribution")
+
+            monkeypatch.setattr(ws, "_install", refuse)
+            assert ws.try_trial({"brokenlib": "1.0.0"}, "true") is TrialOutcome.UNINSTALLABLE
+
+    def test_run_trial_still_collapses_it_to_false_for_the_subset_stage(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        project = make_project(tmp_path)
+        with Workspace(project, "python") as ws:
+
+            def refuse(pins: dict[str, str]) -> Path:
+                raise DepbisectError("no matching distribution")
+
+            monkeypatch.setattr(ws, "_install", refuse)
+            assert ws.run_trial({"brokenlib": "1.0.0"}, "true") is False
+        assert "counting as FAIL" in capsys.readouterr().err
+
+    def test_pass_and_fail_come_from_the_test_command(self, tmp_path: Path, monkeypatch) -> None:
+        project = make_project(tmp_path)
+        with Workspace(project, "python") as ws:
+            monkeypatch.setattr(ws, "_install", lambda pins: None)
+            assert ws.try_trial({}, "true") is TrialOutcome.PASS
+            assert ws.try_trial({}, "false") is TrialOutcome.FAIL

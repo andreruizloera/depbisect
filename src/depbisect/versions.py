@@ -108,6 +108,21 @@ def compare(a: str, b: str) -> int:
     return 0
 
 
+def strictly_between(text: str, good: str, bad: str) -> bool:
+    """Is ``text`` strictly inside the interval the bisection will walk?
+
+    Order-insensitive, so it holds for a downgrade (bad older than good)
+    too. An unparseable version is not between anything, because it
+    cannot be placed on the path at all.
+    """
+    try:
+        v, vg, vb = parse_version(text), parse_version(good), parse_version(bad)
+    except VersionParseError:
+        return False
+    lo, hi = (vg, vb) if vg < vb else (vb, vg)
+    return lo < v < hi
+
+
 def version_path(good: str, bad: str, available: list[str]) -> list[str]:
     """Ordered list of versions to bisect over, from good to bad inclusive.
 
@@ -135,9 +150,7 @@ def version_path(good: str, bad: str, available: list[str]) -> list[str]:
     return [good] + [v.text for v in between] + [bad]
 
 
-_DIST_FILE_RE = re.compile(
-    r"^(?P<name>.+?)-(?P<version>\d[^-]*)(?:-[\w.]+-[\w.]+-[\w.]+\.whl|\.tar\.gz|\.zip)$"
-)
+_SDIST_SUFFIXES = (".tar.gz", ".zip", ".tar.bz2")
 
 
 def normalize_name(name: str) -> str:
@@ -145,12 +158,38 @@ def normalize_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def split_dist_filename(filename: str) -> tuple[str, str] | None:
+    """Split a wheel or sdist filename into (normalized name, version).
+
+    Returns None for anything that is not a recognizable distribution
+    filename, including signatures and metadata files. Wheels are
+    ``name-version[-build]-py-abi-platform.whl``, where neither the name
+    nor the version may contain a dash, so the first two dash-separated
+    fields are exactly what we want. Sdists are ``name-version.suffix``
+    and their names may contain dashes, so the version is split off the
+    right.
+    """
+    if filename.endswith(".whl"):
+        parts = filename[: -len(".whl")].split("-")
+        if len(parts) < 5 or not parts[0] or not parts[1]:
+            return None
+        return normalize_name(parts[0]), parts[1]
+    for suffix in _SDIST_SUFFIXES:
+        if filename.endswith(suffix):
+            stem = filename[: -len(suffix)]
+            name, sep, version = stem.rpartition("-")
+            if not sep or not name or not version:
+                return None
+            return normalize_name(name), version
+    return None
+
+
 def local_versions(package: str, find_links: list[Path]) -> list[str]:
     """Versions of ``package`` discoverable in local wheel/sdist directories.
 
-    This is the only candidate source depbisect uses: it never talks to
-    the network. Filenames follow the standard dist naming convention
-    (``name-version-...whl`` / ``name-version.tar.gz``).
+    This candidate source never talks to the network. Filenames follow
+    the standard dist naming convention (``name-version-...whl`` /
+    ``name-version.tar.gz``).
     """
     target = normalize_name(package)
     found: set[str] = set()
@@ -158,12 +197,10 @@ def local_versions(package: str, find_links: list[Path]) -> list[str]:
         if not directory.is_dir():
             continue
         for entry in directory.iterdir():
-            m = _DIST_FILE_RE.match(entry.name)
-            if not m:
+            split = split_dist_filename(entry.name)
+            if split is None or split[0] != target:
                 continue
-            if normalize_name(m.group("name")) != target:
-                continue
-            found.add(m.group("version"))
+            found.add(split[1])
     try:
         return sorted(found, key=parse_version)
     except VersionParseError:

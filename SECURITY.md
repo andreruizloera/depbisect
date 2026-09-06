@@ -25,6 +25,25 @@ mode.
 Manifest and lockfile parsing uses only the standard library
 (`tomllib`, `json`) and never evaluates file content as code.
 
+## Network access
+
+depbisect issues no network request of its own unless you pass
+`--online`. With it, the only requests made are GET requests to the
+simple repository API for the packages being bisected, at
+`https://pypi.org/simple/` or whatever `--index-url` names. The URL
+scheme is checked and must be http or https, so an index URL cannot be
+used to read a local file. Responses are parsed as text with `json`
+and `html.parser`; no part of a response is executed, and nothing is
+written to disk.
+
+`--online` does widen the exposure of point 2 above, because it finds
+intermediate releases to install that you would not otherwise have
+tested. An index that has been tampered with can offer versions that
+do not exist upstream, and depbisect will install them in the trial
+environment. If that matters for your threat model, `--find-links`
+with a directory you control is the alternative, and it is still the
+default.
+
 ## Reporting
 
 Open a GitHub issue for anything that does not require confidentiality.

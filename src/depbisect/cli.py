@@ -12,6 +12,7 @@ from depbisect.bisector import (
     estimate_runs,
     minimize_breaking_set,
 )
+from depbisect.candidates import CandidateSet, build_candidates
 from depbisect.diffing import ChangedDep, diff_states
 from depbisect.errors import DepbisectError
 from depbisect.gitref import (
@@ -21,9 +22,9 @@ from depbisect.gitref import (
     read_at_ref,
     short_ref,
 )
+from depbisect.index import DEFAULT_INDEX_URL
 from depbisect.manifests import DepState, detect_ecosystem, parse_state, pick_source
-from depbisect.sandbox import Workspace
-from depbisect.versions import VersionParseError, local_versions, version_path
+from depbisect.sandbox import TrialOutcome, Workspace
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="forbid the package index entirely; install only from --find-links",
     )
+    _add_index_options(run)
     run.add_argument(
         "--timeout",
         type=int,
@@ -91,12 +93,65 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--verbose", action="store_true", help="stream install/test output instead of capturing it"
     )
+
+    versions = sub.add_parser(
+        "versions",
+        help="show the candidate versions a bisection would walk, without running anything",
+    )
+    versions.add_argument("package", help="package name")
+    versions.add_argument(
+        "--from", dest="good", required=True, metavar="VERSION", help="known-good"
+    )
+    versions.add_argument("--to", dest="bad", required=True, metavar="VERSION", help="known-bad")
+    versions.add_argument(
+        "--find-links",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="local directory of wheels/sdists to draw candidates from (repeatable)",
+    )
+    _add_index_options(versions)
+    versions.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        metavar="SECONDS",
+        help="index request timeout (default: 30)",
+    )
     return parser
+
+
+def _add_index_options(parser: argparse.ArgumentParser) -> None:
+    """Flags shared by ``run`` and ``versions``. Network is opt-in."""
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="query the package index for the releases between the good and bad "
+        "versions (Python only). Off by default: without it depbisect makes no "
+        "network request of its own",
+    )
+    parser.add_argument(
+        "--index-url",
+        metavar="URL",
+        help=f"simple-index base URL for --online and for installs (default: {DEFAULT_INDEX_URL})",
+    )
+    parser.add_argument(
+        "--pre",
+        action="store_true",
+        help="include pre-releases (alpha, beta, rc, dev) from the index",
+    )
+    parser.add_argument(
+        "--include-yanked",
+        action="store_true",
+        help="include yanked releases from the index",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "versions":
+            return show_versions(args)
         return run_session(args)
     except DepbisectError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -106,12 +161,84 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
+TRIAL_PYTHON = sys.version_info[:3]
+
+
+def _check_index_options(args: argparse.Namespace, ecosystem: str | None = None) -> None:
+    """Reject flag combinations that cannot mean anything, before any work."""
+    if getattr(args, "no_index", False):
+        if args.online:
+            raise DepbisectError(
+                "--online and --no-index contradict each other: --online finds releases "
+                "at the index and --no-index forbids installing from it, so nothing "
+                "found could be tested"
+            )
+        if args.index_url:
+            raise DepbisectError("--index-url has no meaning with --no-index")
+    if args.online and ecosystem == "node":
+        raise DepbisectError(
+            "--online reads a Python simple index; there is no npm registry support yet, "
+            "so Node candidate versions still come from --find-links only"
+        )
+    if (args.pre or args.include_yanked) and not args.online:
+        raise DepbisectError(
+            "--pre and --include-yanked filter the index candidate list, so they need "
+            "--online; versions found in a --find-links directory are never filtered"
+        )
+
+
+def show_versions(args: argparse.Namespace) -> int:
+    """``depbisect versions``: print the path a bisection would walk."""
+    _check_index_options(args)
+    candidates = build_candidates(
+        args.package,
+        args.good,
+        args.bad,
+        find_links=[Path(d) for d in args.find_links],
+        online=args.online,
+        index_url=args.index_url or DEFAULT_INDEX_URL,
+        python=TRIAL_PYTHON,
+        allow_pre=args.pre,
+        allow_yanked=args.include_yanked,
+        timeout=args.timeout,
+    )
+    if candidates.note is not None:
+        raise DepbisectError(f"index query failed: {candidates.note}")
+
+    where = _source_phrase(candidates, args.index_url or DEFAULT_INDEX_URL)
+    print(f"{args.package}: {len(candidates.path)} candidate version(s) to bisect ({where})\n")
+    for version in candidates.path:
+        label = ""
+        if version == candidates.path[0]:
+            label = "  (good)"
+        elif version == candidates.path[-1]:
+            label = "  (bad)"
+        print(f"  {version}{label}")
+    exclusions = candidates.describe_exclusions(TRIAL_PYTHON if args.online else None)
+    print()
+    if exclusions:
+        print(f"  {exclusions}")
+    print(f"  Bisection would need at most {candidates.max_runs()} test run(s).")
+    return 0
+
+
+def _source_phrase(candidates: CandidateSet, index_url: str) -> str:
+    if candidates.source == "index":
+        return f"source: index {index_url}"
+    if candidates.source == "index and local":
+        return f"source: index {index_url} and local wheels"
+    if candidates.source == "local":
+        return "source: local wheels"
+    return "no intermediate releases found"
+
+
 def run_session(args: argparse.Namespace) -> int:
     project = Path(args.directory).resolve()
     if not project.is_dir():
         raise DepbisectError(f"{project} is not a directory")
 
     ecosystem = detect_ecosystem(project)
+    _check_index_options(args, ecosystem)
     source = pick_source(project, ecosystem)
     bad_ref = args.bad_ref or WORKTREE
     if (args.good_ref or bad_ref != WORKTREE) and not is_git_repo(project):
@@ -141,7 +268,7 @@ def run_session(args: argparse.Namespace) -> int:
         )
 
     find_links = [Path(d) for d in args.find_links]
-    candidates = _candidate_paths(changed, find_links, ecosystem)
+    candidates = _candidate_paths(changed, find_links, ecosystem, args)
 
     if args.dry_run:
         _print_plan(project, ecosystem, source, good_ref, bad_ref, args.test, changed, candidates)
@@ -156,24 +283,43 @@ def _read_state(project: Path, ref: str, source: str, ecosystem: str) -> DepStat
 
 
 def _candidate_paths(
-    changed: list[ChangedDep], find_links: list[Path], ecosystem: str
-) -> dict[str, list[str]]:
-    """Offline candidate version path per version-changed dependency.
+    changed: list[ChangedDep],
+    find_links: list[Path],
+    ecosystem: str,
+    args: argparse.Namespace,
+) -> dict[str, CandidateSet]:
+    """Candidate version path per version-changed dependency.
 
-    Candidates come only from local dist directories (--find-links).
-    When none are found, the path is just [good, bad]: depbisect then
-    bisects between the two known versions only, and says so.
+    Candidates come from local dist directories (--find-links) and, with
+    --online, from the package index. When neither yields anything the
+    path is just [good, bad]: depbisect then bisects between the two
+    known versions only, and says so in the report.
     """
-    paths: dict[str, list[str]] = {}
+    paths: dict[str, CandidateSet] = {}
     for dep in changed:
         if dep.kind != "changed":
             continue
         assert dep.good is not None and dep.bad is not None
-        available = local_versions(dep.name, find_links) if ecosystem == "python" else []
-        try:
-            paths[dep.name] = version_path(dep.good, dep.bad, available)
-        except VersionParseError:
-            paths[dep.name] = [dep.good, dep.bad]
+        candidates = build_candidates(
+            dep.name,
+            dep.good,
+            dep.bad,
+            find_links=find_links,
+            online=args.online and ecosystem == "python",
+            index_url=args.index_url or DEFAULT_INDEX_URL,
+            python=TRIAL_PYTHON,
+            allow_pre=args.pre,
+            allow_yanked=args.include_yanked,
+        )
+        if candidates.note is not None:
+            # A dead index is not a dead session: say so and carry on with
+            # whatever local candidates there are.
+            print(
+                f"warning: index query for {dep.name} failed, using local candidates only: "
+                f"{candidates.note}",
+                file=sys.stderr,
+            )
+        paths[dep.name] = candidates
     return paths
 
 
@@ -185,7 +331,7 @@ def _print_plan(
     bad_ref: str,
     test_cmd: str,
     changed: list[ChangedDep],
-    candidates: dict[str, list[str]],
+    candidates: dict[str, CandidateSet],
 ) -> None:
     print("depbisect plan (dry run)\n")
     print(f"  Project:   {project} ({ecosystem})")
@@ -198,15 +344,22 @@ def _print_plan(
     max_candidates = 2
     for dep in changed:
         line = f"    {dep.name:<{width}}  {dep.describe()}"
-        path = candidates.get(dep.name)
-        if path is not None:
-            interior = len(path) - 2
-            if interior > 0:
-                line += f"   ({interior} intermediate version(s) available locally)"
-                max_candidates = max(max_candidates, len(path))
+        found = candidates.get(dep.name)
+        if found is not None:
+            if found.interior > 0:
+                where = {
+                    "index": "from the index",
+                    "index and local": "from the index and local wheels",
+                    "local": "found locally",
+                }[found.source]
+                line += f"   ({found.interior} intermediate release(s) {where})"
+                max_candidates = max(max_candidates, len(found.path))
             else:
-                line += "   (no intermediate versions found locally)"
+                line += "   (no intermediate versions found)"
         print(line)
+        exclusions = found.describe_exclusions() if found else None
+        if exclusions:
+            print(f"    {'':<{width}}  {exclusions.lower()}")
     lo, hi = estimate_runs(len(changed), max_candidates)
     print(f"\n  Estimated test runs: {lo} to {hi}")
     print("  Dry run: nothing was installed and no files were modified.")
@@ -218,7 +371,7 @@ def _bisect(
     good_state: DepState,
     bad_state: DepState,
     changed: list[ChangedDep],
-    candidates: dict[str, list[str]],
+    candidates: dict[str, CandidateSet],
     args: argparse.Namespace,
 ) -> int:
     total_runs = 0
@@ -230,6 +383,7 @@ def _bisect(
         keep=args.keep_temp,
         no_index=args.no_index,
         find_links=find_links,
+        index_url=args.index_url,
         timeout=args.timeout,
         verbose=args.verbose,
     ) as ws:
@@ -287,17 +441,21 @@ def _bisect(
             return 0
 
         # Stage 2: bisect the culprit's candidate versions.
-        path = candidates[culprit.name]
+        candidate_set = candidates[culprit.name]
 
-        def version_oracle(version: str) -> bool:
+        def version_oracle(version: str) -> bool | None:
             print(f"bisect:   {culprit.name}=={version} ... ", end="", flush=True)
             pins = pins_with_reverted(all_names - {culprit.name})
             pins[culprit.name] = version
-            passed = ws.run_trial(pins, args.test)
+            outcome = ws.try_trial(pins, args.test)
+            if outcome is TrialOutcome.UNINSTALLABLE:
+                print("SKIP (will not install here)")
+                return None
+            passed = outcome is TrialOutcome.PASS
             print("PASS" if passed else "FAIL")
             return passed
 
-        result = bisect_versions(path, version_oracle)
+        result = bisect_versions(candidate_set.path, version_oracle)
         total_runs += result.runs
 
         _report_success(
@@ -306,7 +464,8 @@ def _bisect(
             result.first_failing,
             args.test,
             total_runs,
-            len(path),
+            candidate_set,
+            result.skipped,
         )
         if args.keep_temp:
             print(f"\nworkspace kept at {ws.copy_dir}")
@@ -319,7 +478,8 @@ def _report_success(
     first_failing: str,
     test_cmd: str,
     runs: int,
-    path_len: int,
+    candidates: CandidateSet,
+    skipped: list[str],
 ) -> None:
     print("\nDependency regression isolated\n")
     print(f"  Package:       {package}")
@@ -327,12 +487,37 @@ def _report_success(
     print(f"  First failing: {first_failing}")
     print(f"  Test:          {test_cmd}")
     print(f"  Runs:          {runs}")
-    if path_len <= 2:
+    sources = {
+        "index": "candidates from the package index",
+        "index and local": "candidates from the package index and local wheels",
+        "local": "candidates from local wheels",
+        "none": "no intermediate candidates",
+    }
+    print(f"  Searched:      {len(candidates.path)} version(s), {sources[candidates.source]}")
+
+    # Everything below is about how tight the boundary actually is. A
+    # bisection that says "3.0.3 to 3.1.4" and a bisection that says
+    # "3.1.0 to 3.1.1" are different answers, and the difference is
+    # entirely in what was available to test.
+    if candidates.interior == 0:
         print(
-            "\n  note: no intermediate versions were available locally, so this "
-            "bisected only between the two known versions. Releases between "
-            f"{last_passing} and {first_failing} were not tested."
+            "\n  note: no intermediate versions were available, so this bisected only "
+            f"between the two known versions. Releases between {last_passing} and "
+            f"{first_failing} were not tested."
         )
+        if candidates.source == "none" and not candidates.note:
+            print("        --online would look them up at the package index.")
+    if skipped:
+        one = len(skipped) == 1
+        print(
+            f"\n  note: {len(skipped)} {'release' if one else 'releases'} between "
+            f"{last_passing} and {first_failing} could not be installed here and "
+            f"{'was' if one else 'were'} skipped rather than blamed: " + ", ".join(skipped)
+        )
+        print("        the boundary above is therefore not tight.")
+    exclusions = candidates.describe_exclusions()
+    if exclusions:
+        print(f"\n  note: {exclusions.lower()}")
 
 
 def _report_interaction(culprits: list[ChangedDep], test_cmd: str, runs: int) -> None:

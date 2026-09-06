@@ -4,14 +4,25 @@ Honest future work, none of it implemented yet.
 
 ## Candidate discovery
 
-- Optional network mode (`--online`) that queries the PyPI JSON API or
-  the npm registry for the full release list between good and bad, so
-  version bisection covers every published release instead of only
-  locally available distributions.
+Shipped: `--online` reads the simple repository API (PEP 691 JSON or
+PEP 503 HTML) for the releases between good and bad, filtered by
+pre-release status, yanked status, and `Requires-Python`. Still open:
+
+- An npm registry client, so `--online` works for Node projects too.
+  The candidate path and the search are already ecosystem-agnostic;
+  only the client is missing.
 - Read candidate versions out of the pip and uv wheel caches, which are
   often already warm on developer machines and keep the offline
   guarantee.
-- Yanked-release awareness when a network source is added.
+- Cache index responses on disk with a short expiry, so re-running a
+  bisection on the same package does not re-fetch the listing.
+- Bisect only the releases that actually have an installable
+  distribution for this platform, by reading wheel tags from the index
+  listing rather than discovering it one failed install at a time. That
+  would turn most skips into exclusions, which cost no test run.
+- Authenticated and mirrored indexes: honour `PIP_INDEX_URL`,
+  `UV_INDEX_URL`, and netrc credentials instead of requiring
+  `--index-url` explicitly.
 
 ## Ecosystems
 
