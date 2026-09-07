@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end demo of depbisect against a deliberately broken dependency
-# bump. Runs fully offline, in three parts:
+# bump. Runs fully offline, in four parts:
 #
 #   1. Local wheels only: the "package index" is a directory of wheels
 #      committed under examples/demo/wheels.
@@ -14,6 +14,8 @@
 #      listing already proves unusable, so it is excluded before any
 #      test run; the other has only an sdist, which might have built,
 #      so it is probed, and skipped and named when it does not.
+#   4. The same regression in a Poetry project, to show that the
+#      manifest a project happens to use does not change the answer.
 #
 # The scenario: a demo app pins brokenlib==1.0.0 and okpkg==1.0.0 (the
 # committed, known-good state). Someone bumps both pins in the working
@@ -177,4 +179,49 @@ if grep -q "bisect:   brokenlib==1.5.0" "$WORK/part3.txt"; then
 fi
 
 echo
-echo "demo: all three parts matched the output the README documents."
+echo "=============================================================="
+echo "Part 4: the same regression, pinned in a poetry.lock"
+echo "=============================================================="
+POETRY_PROJECT="$WORK/poetry-project"
+mkdir -p "$POETRY_PROJECT"
+cp "$ROOT/examples/demo/project/app.py" "$ROOT/examples/demo/project/test_app.py" "$POETRY_PROJECT"
+cp "$ROOT/examples/demo/poetry/pyproject.toml" "$ROOT/examples/demo/poetry/poetry.lock" \
+    "$POETRY_PROJECT"
+cd "$POETRY_PROJECT"
+git init -q
+git -c user.name=demo -c user.email=demo@example.invalid add .
+git -c user.name=demo -c user.email=demo@example.invalid commit -qm "lock known-good dependencies"
+cp "$ROOT/examples/demo/poetry/bad/poetry.lock" "$POETRY_PROJECT/poetry.lock"
+
+echo "$ depbisect run --test \"python test_app.py\" --find-links examples/demo/wheels --dry-run"
+"${DEPBISECT[@]}" run \
+    --test "python test_app.py" \
+    --find-links "$WHEELS" \
+    --dry-run | tee "$WORK/part4-plan.txt"
+require "$WORK/part4-plan.txt" \
+    "depbisect plan (dry run)" \
+    "poetry-project (python)" \
+    "Manifest:  poetry.lock" \
+    "Good ref:  " \
+    "Bad state: working tree" \
+    "Test:      python test_app.py" \
+    "Changed dependencies (2):" \
+    "brokenlib  1.0.0 -> 2.0.0   (2 intermediate release(s) found locally)" \
+    "okpkg      1.0.0 -> 1.1.0   (no intermediate versions found)" \
+    "Estimated test runs: 4 to 14" \
+    "Dry run: nothing was installed and no files were modified."
+
+echo
+echo "$ depbisect run --test \"python test_app.py\" --no-index --find-links examples/demo/wheels"
+"${DEPBISECT[@]}" run \
+    --test "python test_app.py" \
+    --no-index \
+    --find-links "$WHEELS" | tee "$WORK/part4.txt"
+require "$WORK/part4.txt" \
+    "Package:       brokenlib" \
+    "Last passing:  1.2.0" \
+    "First failing: 2.0.0" \
+    "candidates from local wheels"
+
+echo
+echo "demo: all four parts matched the output the README documents."

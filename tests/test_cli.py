@@ -40,6 +40,34 @@ def project(tmp_path: Path) -> Path:
     return proj
 
 
+POETRY_LOCK = """\
+[[package]]
+name = "brokenlib"
+version = "{brokenlib}"
+
+[[package]]
+name = "okpkg"
+version = "{okpkg}"
+
+[metadata]
+lock-version = "2.1"
+"""
+
+
+@pytest.fixture
+def poetry_project(tmp_path: Path) -> Path:
+    """The same regression, locked by Poetry instead of pinned in a txt file."""
+    proj = tmp_path / "poetry-proj"
+    proj.mkdir()
+    git(proj, "init", "-q")
+    (proj / "pyproject.toml").write_text('[tool.poetry]\nname = "app"\n')
+    (proj / "poetry.lock").write_text(POETRY_LOCK.format(brokenlib="1.0.0", okpkg="1.0.0"))
+    git(proj, "add", ".")
+    git(proj, "commit", "-qm", "good lock")
+    (proj / "poetry.lock").write_text(POETRY_LOCK.format(brokenlib="2.0.0", okpkg="1.1.0"))
+    return proj
+
+
 @pytest.fixture
 def wheels(tmp_path: Path) -> Path:
     d = tmp_path / "wheels"
@@ -226,6 +254,28 @@ class TestFullSessionMocked:
         code = main(["run", "--test", "pytest", "-C", str(project)])
         assert code == 2
         assert "regression is probably in your code" in capsys.readouterr().err
+
+    def test_a_poetry_project_reaches_the_same_verdict(
+        self, poetry_project: Path, wheels: Path, capsys, monkeypatch
+    ) -> None:
+        # poetry.lock wins over the pyproject.toml beside it, and the
+        # search that follows knows nothing about which one it was.
+        monkeypatch.setattr(Workspace, "try_trial", fake_trials({"brokenlib": "2.0.0"}))
+        code = main(
+            ["run", "--test", "pytest", "-C", str(poetry_project), "--find-links", str(wheels)]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Package:       brokenlib" in out
+        assert "Last passing:  1.2.0" in out
+        assert "First failing: 2.0.0" in out
+
+    def test_the_poetry_plan_names_the_lockfile_it_read(self, poetry_project: Path, capsys) -> None:
+        code = main(["run", "--test", "pytest", "-C", str(poetry_project), "--dry-run"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Manifest:  poetry.lock" in out
+        assert "brokenlib" in out and "1.0.0 -> 2.0.0" in out
 
     def test_added_dependency_reported(self, project: Path, capsys, monkeypatch) -> None:
         (project / "requirements.txt").write_text("brokenlib==1.0.0\nokpkg==1.0.0\nnewdep==0.1.0\n")

@@ -26,7 +26,10 @@ may build. Still open:
 
 ## Ecosystems
 
-- poetry.lock and Pipfile.lock parsers for Python.
+Shipped: `uv.lock`, `poetry.lock`, `Pipfile.lock`, `requirements.txt`,
+and pinned `pyproject.toml` dependencies for Python; `package.json`
+plus `package-lock.json` for Node. Still open:
+
 - pnpm-lock.yaml and yarn.lock parsers for Node.
 - Cargo.lock (Rust) and go.mod/go.sum (Go); the search core is
   ecosystem-agnostic already, only parsers and installers are needed.

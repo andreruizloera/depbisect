@@ -307,10 +307,35 @@ nothing, and runs no tests.
 
 Exit codes: 0 success, 2 usage or git error, 130 interrupted.
 
-Supported manifests: `uv.lock`, `requirements.txt` (pinned), pinned
-`pyproject.toml` dependencies for Python; `package.json` plus
-`package-lock.json` (v1 to v3) for Node. Lockfiles win when several
-are present.
+Supported manifests: `uv.lock`, `poetry.lock`, `Pipfile.lock`,
+`requirements.txt` (pinned), pinned `pyproject.toml` dependencies for
+Python; `package.json` plus `package-lock.json` (v1 to v3) for Node.
+Lockfiles win when several are present, and which one a project uses
+does not change the search:
+
+```text
+$ depbisect run --test "python test_app.py" --find-links examples/demo/wheels --dry-run
+depbisect plan (dry run)
+
+  Project:   /var/folders/.../poetry-project (python)
+  Manifest:  poetry.lock
+  Good ref:  bd50e2ab53461db0c62140aa1da616a50762f9c6 (bd50e2a)
+  Bad state: working tree
+  Test:      python test_app.py
+
+  Changed dependencies (2):
+    brokenlib  1.0.0 -> 2.0.0   (2 intermediate release(s) found locally)
+    okpkg      1.0.0 -> 1.1.0   (no intermediate versions found)
+
+  Estimated test runs: 4 to 14
+  Dry run: nothing was installed and no files were modified.
+```
+
+Trials install the pinned set with `uv` or `pip` regardless of which
+tool wrote the lockfile, so a Poetry or Pipenv project is bisected
+without invoking `poetry` or `pipenv`. The plan above is part 4 of
+`./demo.sh`, where the commit hash and the temporary path differ every
+run.
 
 ## Safety guarantee
 
@@ -335,8 +360,9 @@ to forbid that.
 ```
 src/depbisect/
   cli.py        argument parsing and session orchestration
-  manifests.py  lockfile/manifest parsers (uv.lock, requirements.txt,
-                pyproject.toml, package-lock.json) -> {name: version}
+  manifests.py  lockfile/manifest parsers (uv.lock, poetry.lock,
+                Pipfile.lock, requirements.txt, pyproject.toml,
+                package-lock.json) -> {name: version}
   gitref.py     read manifests at git refs via git show; good-ref
                 auto-detection
   diffing.py    changed-dependency set between two states
@@ -402,10 +428,13 @@ culprit over whatever candidate list is derivable offline.
 - Multi-dependency interaction detection is experimental: when no
   single revert fixes the test, the minimal reverting set is reported
   as a lead, without per-package version bisection.
-- Python trials install only the pinned dependency set; projects whose
-  tests need the project itself installed (`pip install -e .`) should
-  make the test command handle that, or run tests that import from the
-  source tree.
+- Python trials install only the pinned dependency set, with `uv` or
+  `pip`, whichever lockfile the pins came from. Projects whose tests
+  need the project itself installed (`pip install -e .`) should make
+  the test command handle that, or run tests that import from the
+  source tree, and a project relying on Poetry or Pipenv install
+  semantics beyond the pinned versions (extras resolution, group
+  selection) gets the pins and not those semantics.
 - Node trials run `npm install` in the copy, which needs registry
   access (or a warm npm cache); the offline guarantee is Python-only.
 - Assumes a single pass/fail boundary; flaky tests will mislead any

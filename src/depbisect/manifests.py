@@ -19,7 +19,13 @@ from depbisect.versions import normalize_name
 
 # Files we know how to read, in priority order per ecosystem. Lockfiles
 # beat manifests because they carry exact versions.
-PYTHON_SOURCES = ("uv.lock", "requirements.txt", "pyproject.toml")
+PYTHON_SOURCES = (
+    "uv.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "requirements.txt",
+    "pyproject.toml",
+)
 NODE_SOURCES = ("package-lock.json",)
 
 
@@ -40,8 +46,9 @@ def detect_ecosystem(project: Path) -> str:
     if (project / "package.json").is_file():
         return "node"
     raise DepbisectError(
-        f"no supported manifest found in {project} "
-        "(looked for uv.lock, requirements.txt, pyproject.toml, package.json)"
+        f"no supported manifest found in {project} (looked for "
+        + ", ".join(PYTHON_SOURCES)
+        + ", package.json)"
     )
 
 
@@ -63,6 +70,10 @@ def parse_state(source: str, content: str, ecosystem: str) -> DepState:
     if ecosystem == "python":
         if source.endswith("uv.lock"):
             return _parse_uv_lock(source, content)
+        if source.endswith("poetry.lock"):
+            return _parse_poetry_lock(source, content)
+        if source.endswith("Pipfile.lock"):
+            return _parse_pipfile_lock(source, content)
         if source.endswith("pyproject.toml"):
             return _parse_pyproject(source, content)
         return _parse_requirements(source, content)
@@ -108,6 +119,80 @@ def _parse_uv_lock(source: str, content: str) -> DepState:
         if any(key in src for key in ("editable", "virtual", "directory")):
             continue
         state.pins[normalize_name(name)] = str(version)
+    return state
+
+
+#: poetry.lock ``[package.source]`` types whose "version" is not
+#: something a package index can hand you a different release of.
+_POETRY_LOCAL_SOURCES = frozenset({"directory", "file", "url", "git"})
+#: The Pipfile.lock keys that mean the same thing.
+_PIPENV_LOCAL_KEYS = frozenset({"path", "file", "url", "git"})
+
+
+def _parse_poetry_lock(source: str, content: str) -> DepState:
+    """Parse a poetry.lock (lock-version 1.x and 2.x share this shape).
+
+    Every locked package is an ``[[package]]`` table with a name and a
+    version, whichever dependency group it came from: a bisection wants
+    the test dependencies too. Packages resolved from a directory, a
+    file, a URL, or git are skipped, exactly as uv.lock's local packages
+    are, because there is no release series to bisect for them.
+    """
+    try:
+        data = tomllib.loads(content)
+    except tomllib.TOMLDecodeError as exc:
+        raise DepbisectError(f"cannot parse {source}: {exc}") from exc
+    state = DepState("python", source)
+    packages = data.get("package")
+    if not isinstance(packages, list):
+        return state
+    for pkg in packages:
+        if not isinstance(pkg, dict):
+            continue
+        name, version = pkg.get("name"), pkg.get("version")
+        if not name or not version:
+            continue
+        src = pkg.get("source")
+        if isinstance(src, dict) and src.get("type") in _POETRY_LOCAL_SOURCES:
+            continue
+        state.pins[normalize_name(str(name))] = str(version)
+    return state
+
+
+def _parse_pipfile_lock(source: str, content: str) -> DepState:
+    """Parse a Pipfile.lock: JSON, with "default" and "develop" sections.
+
+    Pipenv writes versions as a specifier string (``"==2.31.0"``), so
+    the operator comes off. An entry pinned to a path, a file, or a git
+    ref has no index version to walk and is recorded as unpinned, which
+    is how the report already talks about a dependency it cannot bisect.
+    """
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise DepbisectError(f"cannot parse {source}: {exc}") from exc
+    state = DepState("python", source)
+    for section in ("default", "develop"):
+        entries = data.get(section)
+        if not isinstance(entries, dict):
+            continue
+        for name, info in entries.items():
+            if not isinstance(info, dict):
+                continue
+            if info.get("editable") or _PIPENV_LOCAL_KEYS & set(info):
+                state.unpinned.append(str(name))
+                continue
+            version = info.get("version")
+            if not isinstance(version, str):
+                state.unpinned.append(str(name))
+                continue
+            pinned = version.strip()
+            if not pinned.startswith("=="):
+                # A Pipfile.lock entry that is not an exact pin cannot
+                # anchor a bisection; naming it beats guessing at it.
+                state.unpinned.append(f"{name}{pinned}")
+                continue
+            state.pins[normalize_name(str(name))] = pinned[2:].strip()
     return state
 
 

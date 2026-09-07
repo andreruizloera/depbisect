@@ -1,0 +1,18 @@
+# The demo app again, this time as a Poetry project. depbisect reads
+# poetry.lock next to this file, because a lockfile carries exact
+# versions and a pyproject dependency range does not.
+[tool.poetry]
+name = "demo-app"
+version = "0.1.0"
+description = "depbisect demo fixture"
+authors = ["depbisect demo <demo@example.invalid>"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.12"
+brokenlib = "^1.0.0"
+okpkg = "^1.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
