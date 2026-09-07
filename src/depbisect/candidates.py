@@ -7,6 +7,12 @@ bisector will walk, plus an account of what was left out and why, so the
 report can say what was searched instead of implying it searched
 everything.
 
+A release is dropped for one of four reasons: it is a pre-release, it is
+yanked, its ``Requires-Python`` excludes the trial interpreter, or every
+distribution it published is a wheel tagged for some other platform. The
+first two have flags that put them back; the last two are facts about
+the machine the trials will run on.
+
 Filtering applies to INDEX candidates only. A wheel sitting in a
 directory you pointed at is a version you chose deliberately, so
 depbisect does not second-guess it; a release the index happens to list
@@ -21,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from depbisect.index import DEFAULT_INDEX_URL, IndexError_, Release, fetch_releases
+from depbisect.tags import Tag
 from depbisect.versions import (
     VersionParseError,
     local_versions,
@@ -31,6 +38,25 @@ from depbisect.versions import (
 
 Fetcher = Callable[..., list[Release]]
 
+PRE = "pre-release"
+YANKED = "yanked"
+PYTHON = "python"
+PLATFORM = "platform"
+
+
+@dataclass(frozen=True)
+class Excluded:
+    """One release the index listed that the bisection will not walk.
+
+    ``reason`` is one of the four constants above and decides the count
+    it lands in; ``detail`` is the human sentence, which carries the
+    specifier or the flag that would have kept the release.
+    """
+
+    version: str
+    reason: str
+    detail: str
+
 
 @dataclass(frozen=True)
 class CandidateSet:
@@ -40,9 +66,9 @@ class CandidateSet:
     path: list[str]
     #: "index", "local", "index and local", or "none".
     source: str
-    excluded_pre: int = 0
-    excluded_yanked: int = 0
-    excluded_python: int = 0
+    #: Index releases inside the interval that were filtered out, in the
+    #: order the index listed them. Local candidates are never here.
+    excluded_versions: tuple[Excluded, ...] = ()
     #: Set when the index was asked for and could not answer.
     note: str | None = None
 
@@ -53,7 +79,26 @@ class CandidateSet:
 
     @property
     def excluded(self) -> int:
-        return self.excluded_pre + self.excluded_yanked + self.excluded_python
+        return len(self.excluded_versions)
+
+    def _count(self, reason: str) -> int:
+        return sum(1 for item in self.excluded_versions if item.reason == reason)
+
+    @property
+    def excluded_pre(self) -> int:
+        return self._count(PRE)
+
+    @property
+    def excluded_yanked(self) -> int:
+        return self._count(YANKED)
+
+    @property
+    def excluded_python(self) -> int:
+        return self._count(PYTHON)
+
+    @property
+    def excluded_platform(self) -> int:
+        return self._count(PLATFORM)
 
     def max_runs(self) -> int:
         """Worst-case oracle calls to bisect this path."""
@@ -62,7 +107,11 @@ class CandidateSet:
             runs += 1
         return runs
 
-    def describe_exclusions(self, python: tuple[int, ...] | None = None) -> str | None:
+    def describe_exclusions(
+        self,
+        python: tuple[int, ...] | None = None,
+        platform: str | None = None,
+    ) -> str | None:
         """One line naming what the index offered and we did not test."""
         if not self.excluded:
             return None
@@ -78,6 +127,9 @@ class CandidateSet:
             parts.append(
                 f"{self.excluded_python} not compatible with{where or ' this interpreter'}"
             )
+        if self.excluded_platform:
+            where = f" ({platform})" if platform else ""
+            parts.append(f"{self.excluded_platform} with no distribution for this platform{where}")
         return "Excluded from the index list: " + ", ".join(parts)
 
 
@@ -90,6 +142,7 @@ def build_candidates(
     online: bool = False,
     index_url: str = DEFAULT_INDEX_URL,
     python: tuple[int, ...] = (),
+    tags: frozenset[Tag] | None = None,
     allow_pre: bool = False,
     allow_yanked: bool = False,
     timeout: float = 30.0,
@@ -103,7 +156,7 @@ def build_candidates(
     """
     local = local_versions(package, list(find_links or []))
     from_index: list[str] = []
-    excluded_pre = excluded_yanked = excluded_python = 0
+    excluded: tuple[Excluded, ...] = ()
     note: str | None = None
 
     if online:
@@ -121,13 +174,13 @@ def build_candidates(
             # "7 releases are not compatible with this interpreter" reads
             # as a fact about this bisection, so it has to be one.
             in_range = [r for r in releases if strictly_between(r.version, good, bad)]
-            kept, excluded_pre, excluded_yanked, excluded_python = filter_releases(
+            from_index, excluded = filter_releases(
                 in_range,
                 python=python,
+                tags=tags,
                 allow_pre=allow_pre,
                 allow_yanked=allow_yanked,
             )
-            from_index = kept
 
     available = sorted(set(local) | set(from_index))
     try:
@@ -151,9 +204,7 @@ def build_candidates(
         package=package,
         path=path,
         source=source,
-        excluded_pre=excluded_pre,
-        excluded_yanked=excluded_yanked,
-        excluded_python=excluded_python,
+        excluded_versions=excluded,
         note=note,
     )
 
@@ -162,34 +213,51 @@ def filter_releases(
     releases: list[Release],
     *,
     python: tuple[int, ...] = (),
+    tags: frozenset[Tag] | None = None,
     allow_pre: bool = False,
     allow_yanked: bool = False,
-) -> tuple[list[str], int, int, int]:
+) -> tuple[list[str], tuple[Excluded, ...]]:
     """Drop releases a bisection should not spend a test run on.
 
-    Returns the kept version strings plus the counts dropped as
-    pre-releases, as yanked, and as incompatible with ``python``. The
-    order of the checks decides which bucket a release lands in, so a
-    yanked pre-release counts once, as a pre-release.
+    Returns the kept version strings and a record per dropped release.
+    The order of the checks decides which bucket a release lands in, so
+    a yanked pre-release is recorded once, as a pre-release.
+
+    ``tags`` is the compatibility tag set of the interpreter trials will
+    run under. None means the host could not be described, and then no
+    release is dropped on tags at all: an unfiltered candidate costs one
+    probe, a wrongly filtered one costs a real answer.
 
     A version string this cannot parse is KEPT. It cannot be ordered, so
     ``version_path`` will drop it anyway; guessing about it here would
     only make the exclusion counts wrong.
     """
     kept: list[str] = []
-    pre = yanked = incompatible = 0
+    excluded: list[Excluded] = []
     for release in releases:
         if not allow_pre and _is_prerelease(release.version):
-            pre += 1
-            continue
-        if not allow_yanked and release.yanked:
-            yanked += 1
-            continue
-        if python and not release.supports(python):
-            incompatible += 1
-            continue
-        kept.append(release.version)
-    return kept, pre, yanked, incompatible
+            excluded.append(Excluded(release.version, PRE, "pre-release (--pre to include)"))
+        elif not allow_yanked and release.yanked:
+            excluded.append(
+                Excluded(release.version, YANKED, "yanked (--include-yanked to include)")
+            )
+        elif python and not release.supports(python):
+            excluded.append(
+                Excluded(release.version, PYTHON, f"Requires-Python {_requires(release)}")
+            )
+        elif tags is not None and not release.installable_on(tags, python):
+            excluded.append(
+                Excluded(release.version, PLATFORM, "no distribution for this platform")
+            )
+        else:
+            kept.append(release.version)
+    return kept, tuple(excluded)
+
+
+def _requires(release: Release) -> str:
+    """The Requires-Python values a release declared, for a message."""
+    stated = [spec for spec in release.requires_python if spec]
+    return ", ".join(dict.fromkeys(stated)) if stated else "(none stated)"
 
 
 def _is_prerelease(text: str) -> bool:

@@ -13,10 +13,12 @@ Two response shapes are handled:
 - PEP 503 HTML, the older anchor listing, where the same two facts live
   in ``data-yanked`` and ``data-requires-python`` attributes.
 
-Everything here parses FILES and folds them up into releases, because a
-version's installability is a property of its files: a release counts as
-yanked only when every one of its files is yanked, and it supports an
-interpreter when any one of its files does.
+Everything here parses FILES and keeps them, because a version's
+installability is a property of its files: a release counts as yanked
+only when every one of its files is yanked, it supports an interpreter
+when any one of its files does, and it is installable on this platform
+when any one of its files is a wheel tagged for this host or an sdist
+that might build here.
 
 Only http and https URLs are accepted. Nothing is executed, nothing is
 downloaded to disk, and the response is parsed with the standard library
@@ -35,6 +37,7 @@ from urllib.request import Request, urlopen
 from depbisect import __version__
 from depbisect.errors import DepbisectError
 from depbisect.specifiers import python_supported
+from depbisect.tags import Tag, wheel_is_compatible
 from depbisect.versions import normalize_name, split_dist_filename
 
 DEFAULT_INDEX_URL = "https://pypi.org/simple/"
@@ -52,14 +55,39 @@ class IndexError_(DepbisectError):
 
 
 @dataclass(frozen=True)
+class DistFile:
+    """One distribution file of one release, as the index listed it."""
+
+    filename: str
+    yanked: bool = False
+    requires_python: str | None = None
+
+
+@dataclass(frozen=True)
 class Release:
-    """One version of a package, folded up from its distribution files."""
+    """One version of a package, together with its distribution files.
+
+    A release holds its files rather than a summary of them because
+    installability is a per-file fact: one usable file is enough, and
+    "usable" means both the interpreter and the platform, which
+    different files answer differently.
+    """
 
     version: str
-    yanked: bool
-    #: The distinct ``Requires-Python`` values across this release's files.
-    #: None inside the tuple means a file that stated no constraint.
-    requires_python: tuple[str | None, ...] = (None,)
+    files: tuple[DistFile, ...] = ()
+
+    @property
+    def yanked(self) -> bool:
+        """Yanked only when every file of the release is yanked."""
+        return bool(self.files) and all(file.yanked for file in self.files)
+
+    @property
+    def requires_python(self) -> tuple[str | None, ...]:
+        """The distinct ``Requires-Python`` values across this release's files.
+
+        None inside the tuple means a file that stated no constraint.
+        """
+        return tuple(dict.fromkeys(file.requires_python for file in self.files)) or (None,)
 
     def supports(self, python: tuple[int, ...]) -> bool:
         """True when at least one file of this release accepts ``python``.
@@ -67,9 +95,25 @@ class Release:
         A release with several files can be partly compatible (an old
         wheel plus a newer sdist); one installable file is enough.
         """
-        if not self.requires_python:
+        if not self.files:
             return True
-        return any(python_supported(spec, python) for spec in self.requires_python)
+        return any(python_supported(file.requires_python, python) for file in self.files)
+
+    def installable_on(self, supported: frozenset[Tag], python: tuple[int, ...] = ()) -> bool:
+        """True when some file is both for this interpreter and this platform.
+
+        An sdist counts: it may build here, and depbisect has no way to
+        know that it will not without trying. So does a wheel whose
+        filename does not parse. A release fails this only when every
+        file it has is a wheel whose tags rule this host out.
+        """
+        if not self.files:
+            return True
+        return any(
+            (not python or python_supported(file.requires_python, python))
+            and wheel_is_compatible(file.filename, supported)
+            for file in self.files
+        )
 
 
 def fetch_releases(
@@ -129,21 +173,14 @@ def parse_index(body: bytes, package: str, *, content_type: str = "") -> list[Re
     return _fold(_html_files(body), package)
 
 
-@dataclass(frozen=True)
-class _File:
-    filename: str
-    yanked: bool
-    requires_python: str | None
-
-
-def _json_files(body: bytes) -> list[_File]:
+def _json_files(body: bytes) -> list[DistFile]:
     try:
         payload = json.loads(body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise IndexError_(f"index response is not valid JSON: {exc}") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
         raise IndexError_("index JSON has no 'files' list; this is not a PEP 691 response")
-    files: list[_File] = []
+    files: list[DistFile] = []
     for entry in payload["files"]:
         if not isinstance(entry, dict):
             continue
@@ -154,7 +191,7 @@ def _json_files(body: bytes) -> list[_File]:
         yanked = entry.get("yanked", False)
         requires = entry.get("requires-python")
         files.append(
-            _File(
+            DistFile(
                 filename,
                 yanked is not False and yanked is not None,
                 requires if isinstance(requires, str) else None,
@@ -168,7 +205,7 @@ class _AnchorParser(HTMLParser):
 
     def __init__(self) -> None:
         super().__init__()
-        self.files: list[_File] = []
+        self.files: list[DistFile] = []
         self._pending: tuple[str | None, bool, str | None] | None = None
         self._text: list[str] = []
 
@@ -194,7 +231,7 @@ class _AnchorParser(HTMLParser):
         # URL's last path segment for indexes that only get the href right.
         filename = "".join(self._text).strip() or _basename(href)
         if filename:
-            self.files.append(_File(filename, yanked, requires))
+            self.files.append(DistFile(filename, yanked, requires))
         self._pending = None
         self._text = []
 
@@ -205,28 +242,20 @@ def _basename(href: str | None) -> str:
     return unquote(urlsplit(href).path.rsplit("/", 1)[-1])
 
 
-def _html_files(body: bytes) -> list[_File]:
+def _html_files(body: bytes) -> list[DistFile]:
     parser = _AnchorParser()
     parser.feed(body.decode("utf-8", errors="replace"))
     parser.close()
     return parser.files
 
 
-def _fold(files: list[_File], package: str) -> list[Release]:
-    """Group files by version. Yanked only when every file is yanked."""
+def _fold(files: list[DistFile], package: str) -> list[Release]:
+    """Group this project's files by version, keeping each file intact."""
     target = normalize_name(package)
-    versions: dict[str, list[_File]] = {}
+    versions: dict[str, list[DistFile]] = {}
     for entry in files:
         split = split_dist_filename(entry.filename)
         if split is None or split[0] != target:
             continue
         versions.setdefault(split[1], []).append(entry)
-    releases = [
-        Release(
-            version=version,
-            yanked=all(entry.yanked for entry in group),
-            requires_python=tuple(dict.fromkeys(entry.requires_python for entry in group)),
-        )
-        for version, group in versions.items()
-    ]
-    return releases
+    return [Release(version=version, files=tuple(group)) for version, group in versions.items()]

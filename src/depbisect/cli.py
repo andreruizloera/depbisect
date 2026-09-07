@@ -25,6 +25,7 @@ from depbisect.gitref import (
 from depbisect.index import DEFAULT_INDEX_URL
 from depbisect.manifests import DepState, detect_ecosystem, parse_state, pick_source
 from depbisect.sandbox import TrialOutcome, Workspace
+from depbisect.tags import host_tags
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -161,7 +162,13 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
+# Facts about the interpreter the trial virtualenv is created with, which
+# is this one (sandbox.py passes sys.executable to `uv venv --python`).
+# Index candidates are filtered against these two and nothing else.
 TRIAL_PYTHON = sys.version_info[:3]
+TRIAL_HOST = host_tags()
+TRIAL_TAGS = TRIAL_HOST.tags if TRIAL_HOST is not None else None
+TRIAL_PLATFORM = TRIAL_HOST.platform if TRIAL_HOST is not None else None
 
 
 def _check_index_options(args: argparse.Namespace, ecosystem: str | None = None) -> None:
@@ -198,6 +205,7 @@ def show_versions(args: argparse.Namespace) -> int:
         online=args.online,
         index_url=args.index_url or DEFAULT_INDEX_URL,
         python=TRIAL_PYTHON,
+        tags=TRIAL_TAGS,
         allow_pre=args.pre,
         allow_yanked=args.include_yanked,
         timeout=args.timeout,
@@ -214,12 +222,24 @@ def show_versions(args: argparse.Namespace) -> int:
         elif version == candidates.path[-1]:
             label = "  (bad)"
         print(f"  {version}{label}")
-    exclusions = candidates.describe_exclusions(TRIAL_PYTHON if args.online else None)
     print()
-    if exclusions:
-        print(f"  {exclusions}")
+    # This subcommand exists to show the candidate path AND what was left
+    # out of it, so every excluded release is named with its reason,
+    # rather than summed into a count as the run report does.
+    if candidates.excluded_versions:
+        width = max(len(item.version) for item in candidates.excluded_versions)
+        print(f"  Not bisected ({candidates.excluded}):")
+        for item in candidates.excluded_versions:
+            print(f"    {item.version:<{width}}  {item.detail}")
+        if candidates.excluded_platform and TRIAL_PLATFORM:
+            print(f"    (this platform: {TRIAL_PLATFORM}, Python {_python_text()})")
+        print()
     print(f"  Bisection would need at most {candidates.max_runs()} test run(s).")
     return 0
+
+
+def _python_text() -> str:
+    return ".".join(str(part) for part in TRIAL_PYTHON)
 
 
 def _source_phrase(candidates: CandidateSet, index_url: str) -> str:
@@ -308,6 +328,7 @@ def _candidate_paths(
             online=args.online and ecosystem == "python",
             index_url=args.index_url or DEFAULT_INDEX_URL,
             python=TRIAL_PYTHON,
+            tags=TRIAL_TAGS,
             allow_pre=args.pre,
             allow_yanked=args.include_yanked,
         )
@@ -357,7 +378,7 @@ def _print_plan(
             else:
                 line += "   (no intermediate versions found)"
         print(line)
-        exclusions = found.describe_exclusions() if found else None
+        exclusions = found.describe_exclusions(platform=TRIAL_PLATFORM) if found else None
         if exclusions:
             print(f"    {'':<{width}}  {exclusions.lower()}")
     lo, hi = estimate_runs(len(changed), max_candidates)
@@ -515,7 +536,7 @@ def _report_success(
             f"{'was' if one else 'were'} skipped rather than blamed: " + ", ".join(skipped)
         )
         print("        the boundary above is therefore not tight.")
-    exclusions = candidates.describe_exclusions()
+    exclusions = candidates.describe_exclusions(platform=TRIAL_PLATFORM)
     if exclusions:
         print(f"\n  note: {exclusions.lower()}")
 

@@ -8,9 +8,12 @@
 #      127.0.0.1 by examples/demo/serve_index.py, so the --online code
 #      path (HTTP request, PEP 503 parsing) runs for real without the
 #      network and without depending on anyone's release history.
-#   3. A full --online bisection against that index, which contains one
-#      release that cannot be installed anywhere: depbisect skips it and
-#      says so, instead of blaming it for the regression.
+#   3. A full --online bisection against that index, which publishes two
+#      releases that cannot be installed here and must be treated
+#      differently: one has only a Windows wheel, which the index
+#      listing already proves unusable, so it is excluded before any
+#      test run; the other has only an sdist, which might have built,
+#      so it is probed, and skipped and named when it does not.
 #
 # The scenario: a demo app pins brokenlib==1.0.0 and okpkg==1.0.0 (the
 # committed, known-good state). Someone bumps both pins in the working
@@ -112,32 +115,64 @@ echo "$ depbisect versions brokenlib --from 1.0.0 --to 2.0.0 --online"
     --online --index-url "$INDEX_URL" | tee "$WORK/part2.txt"
 require "$WORK/part2.txt" \
     "5 candidate version(s) to bisect" \
+    "source: index http://127.0.0.1:" \
     "1.0.0  (good)" \
+    "1.1.0" \
+    "1.2.0" \
+    "1.6.0" \
     "2.0.0  (bad)" \
+    "Not bisected (1):" \
+    "1.5.0  no distribution for this platform" \
+    "(this platform: " \
     "Bisection would need at most 2 test run(s)."
+
+# The Windows-only release must not appear in the path itself.
+if grep -qE "^  1\.5\.0$" "$WORK/part2.txt"; then
+    echo "DEMO CHECK FAILED: a release with no usable distribution is still a candidate" >&2
+    exit 1
+fi
 
 echo
 echo "=============================================================="
 echo "Part 3: the same bisection, candidates from the index"
 echo "=============================================================="
 echo "brokenlib 1.5.0 is published at this index as a Windows-only"
-echo "CPython 3.8 wheel, so it cannot be installed here at all."
+echo "CPython 3.8 wheel: its tags rule this host out, so it is excluded"
+echo "from the candidate path and costs no test run. brokenlib 1.6.0 is"
+echo "published only as an sdist, which might have built here, so it is"
+echo "kept, probed, and skipped when the build fails."
 echo
 echo "$ depbisect run --test \"python test_app.py\" --online"
 "${DEPBISECT[@]}" run \
     --test "python test_app.py" \
     --online --index-url "$INDEX_URL" | tee "$WORK/part3.txt"
 require "$WORK/part3.txt" \
-    "bisect:   brokenlib==1.5.0 ... SKIP (will not install here)" \
+    "baseline: testing bad dependency state ... FAIL" \
+    "baseline: testing good dependency state ... PASS" \
+    "subset:   reverting {brokenlib} ... PASS" \
+    "bisect:   brokenlib==1.2.0 ... PASS" \
+    "bisect:   brokenlib==1.6.0 ... SKIP (will not install here)" \
+    "Dependency regression isolated" \
+    "Package:       brokenlib" \
     "Last passing:  1.2.0" \
     "First failing: 2.0.0" \
-    "candidates from the package index" \
-    "could not be installed here and was skipped rather than blamed: 1.5.0" \
-    "the boundary above is therefore not tight."
+    "Test:          python test_app.py" \
+    "Runs:          5" \
+    "Searched:      5 version(s), candidates from the package index" \
+    "could not be installed here and was skipped rather than blamed: 1.6.0" \
+    "the boundary above is therefore not tight." \
+    "note: excluded from the index list: 1 with no distribution for this platform"
 
 # A release that would not install must never be reported as the culprit.
-if grep -q "First failing: 1.5.0" "$WORK/part3.txt"; then
+if grep -qE "First failing: 1\.(5|6)\.0" "$WORK/part3.txt"; then
     echo "DEMO CHECK FAILED: an uninstallable release was blamed" >&2
+    exit 1
+fi
+
+# The whole point of the tag filter: no test run is spent on a release
+# the index listing already ruled out.
+if grep -q "bisect:   brokenlib==1.5.0" "$WORK/part3.txt"; then
+    echo "DEMO CHECK FAILED: a test run was spent on a tag-excluded release" >&2
     exit 1
 fi
 

@@ -7,12 +7,18 @@ examples/demo/wheels/ over HTTP in the standard simple-repository
 layout, so depbisect's ``--online`` path runs its real HTTP request,
 its real response parsing, and real installs from the result.
 
-One extra release exists only here: brokenlib 1.5.0 is published as a
-Windows-only CPython 3.8 wheel. Nothing in CI or on a developer laptop
-can install it, and its index entry states no Requires-Python, so the
-metadata filter has no reason to drop it. It is the case the
-three-valued bisection exists for: a candidate that fails to INSTALL
-must be skipped and named, not blamed for the regression.
+Two extra releases exist only here, and they are deliberately different
+from each other:
+
+- brokenlib 1.5.0 is published as a Windows-only CPython 3.8 wheel and
+  nothing else. Its wheel tag says, in the index listing, that it cannot
+  be installed on this host, so depbisect drops it from the candidate
+  path without spending a test run on it.
+- brokenlib 1.6.0 is published as a source distribution and nothing
+  else. An sdist has no tags and may well build here, so depbisect must
+  NOT drop it: it stays a candidate, gets probed, and fails to build.
+  That is the case the three-valued bisection exists for, and the
+  release is skipped and named rather than blamed for the regression.
 
 Usage: python examples/demo/serve_index.py PORTFILE
 The chosen port is written to PORTFILE once the socket is listening.
@@ -29,12 +35,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from build_wheels import build_wheel
+from build_wheels import build_failing_sdist, build_wheel
 
 WHEELS_DIR = Path(__file__).parent / "wheels"
 
 # name -> extra (version, wheel tag) releases published only at this index.
-EXTRA = {"brokenlib": [("1.5.0", "cp38-cp38-win_amd64")]}
+EXTRA_WHEELS = {"brokenlib": [("1.5.0", "cp38-cp38-win_amd64")]}
+# name -> versions published here as a source distribution and nothing else.
+EXTRA_SDISTS = {"brokenlib": ["1.6.0"]}
 
 
 def build_tree(root: Path) -> None:
@@ -45,12 +53,17 @@ def build_tree(root: Path) -> None:
         shutil.copy(wheel, packages / wheel.name)
         by_project.setdefault(wheel.name.split("-")[0], []).append(wheel.name)
 
-    for project, releases in EXTRA.items():
+    for project, releases in EXTRA_WHEELS.items():
         for version, tag in releases:
             built = build_wheel(packages, project, version, _PLACEHOLDER)
             renamed = packages / f"{project}-{version}-{tag}.whl"
             built.rename(renamed)
             by_project.setdefault(project, []).append(renamed.name)
+
+    for project, versions in EXTRA_SDISTS.items():
+        for version in versions:
+            sdist = build_failing_sdist(packages, project, version)
+            by_project.setdefault(project, []).append(sdist.name)
 
     simple = root / "simple"
     simple.mkdir()

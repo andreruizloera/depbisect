@@ -10,12 +10,27 @@ from pathlib import Path
 
 import pytest
 
-from depbisect.candidates import build_candidates, filter_releases
-from depbisect.index import IndexError_, Release
+from depbisect.candidates import PLATFORM, PYTHON, build_candidates, filter_releases
+from depbisect.index import DistFile, IndexError_, Release
+from depbisect.tags import Tag
+
+#: Stands in for a host that can install pure-Python wheels and nothing else.
+PURE_PYTHON_HOST = frozenset({Tag("py3", "none", "any")})
 
 
-def release(version: str, *, yanked: bool = False, requires: str | None = None) -> Release:
-    return Release(version=version, yanked=yanked, requires_python=(requires,))
+def release(
+    version: str,
+    *,
+    yanked: bool = False,
+    requires: str | None = None,
+    files: list[str] | None = None,
+) -> Release:
+    """A release whose files default to one universal wheel."""
+    names = files if files is not None else [f"widget-{version}-py3-none-any.whl"]
+    return Release(
+        version=version,
+        files=tuple(DistFile(name, yanked, requires) for name in names),
+    )
 
 
 def fetcher(releases: list[Release]):
@@ -151,50 +166,194 @@ class TestExclusionsCoverTheIntervalOnly:
         assert result.excluded_pre == 0
 
 
+def reasons(excluded: tuple[object, ...]) -> list[tuple[str, str]]:
+    return [(item.version, item.reason) for item in excluded]  # type: ignore[attr-defined]
+
+
 class TestFiltering:
     def test_prereleases_excluded_by_default(self) -> None:
-        kept, pre, yanked, incompatible = filter_releases([release("1.1.0rc1"), release("1.2.0")])
+        kept, excluded = filter_releases([release("1.1.0rc1"), release("1.2.0")])
         assert kept == ["1.2.0"]
-        assert (pre, yanked, incompatible) == (1, 0, 0)
+        assert reasons(excluded) == [("1.1.0rc1", "pre-release")]
 
     def test_pre_flag_keeps_them(self) -> None:
-        kept, pre, _, _ = filter_releases([release("1.1.0rc1")], allow_pre=True)
+        kept, excluded = filter_releases([release("1.1.0rc1")], allow_pre=True)
         assert kept == ["1.1.0rc1"]
-        assert pre == 0
+        assert excluded == ()
 
     def test_yanked_excluded_by_default(self) -> None:
-        kept, _, yanked, _ = filter_releases([release("1.1.0", yanked=True)])
+        kept, excluded = filter_releases([release("1.1.0", yanked=True)])
         assert kept == []
-        assert yanked == 1
+        assert reasons(excluded) == [("1.1.0", "yanked")]
 
     def test_include_yanked_keeps_them(self) -> None:
-        kept, _, yanked, _ = filter_releases([release("1.1.0", yanked=True)], allow_yanked=True)
+        kept, excluded = filter_releases([release("1.1.0", yanked=True)], allow_yanked=True)
         assert kept == ["1.1.0"]
-        assert yanked == 0
+        assert excluded == ()
 
     def test_incompatible_interpreter_excluded(self) -> None:
-        kept, _, _, incompatible = filter_releases(
+        kept, excluded = filter_releases(
             [release("1.1.0", requires=">=3.7,<3.11"), release("1.2.0", requires=">=3.8")],
             python=(3, 13, 0),
         )
         assert kept == ["1.2.0"]
-        assert incompatible == 1
+        assert reasons(excluded) == [("1.1.0", PYTHON)]
+
+    def test_the_exclusion_detail_names_the_specifier(self) -> None:
+        _, excluded = filter_releases([release("1.1.0", requires=">=3.7,<3.11")], python=(3, 13, 0))
+        assert excluded[0].detail == "Requires-Python >=3.7,<3.11"
 
     def test_a_release_lands_in_exactly_one_bucket(self) -> None:
         # A yanked pre-release must not be counted twice.
-        kept, pre, yanked, incompatible = filter_releases([release("1.1.0rc1", yanked=True)])
+        kept, excluded = filter_releases([release("1.1.0rc1", yanked=True)])
         assert kept == []
-        assert (pre, yanked, incompatible) == (1, 0, 0)
+        assert reasons(excluded) == [("1.1.0rc1", "pre-release")]
 
     def test_unparseable_version_is_kept_not_counted(self) -> None:
-        kept, pre, yanked, incompatible = filter_releases([release("not-a-version")])
+        kept, excluded = filter_releases([release("not-a-version")])
         assert kept == ["not-a-version"]
-        assert (pre, yanked, incompatible) == (0, 0, 0)
+        assert excluded == ()
 
     def test_no_interpreter_given_means_no_compatibility_filter(self) -> None:
-        kept, _, _, incompatible = filter_releases([release("1.1.0", requires=">=3.99")])
+        kept, excluded = filter_releases([release("1.1.0", requires=">=3.99")])
         assert kept == ["1.1.0"]
-        assert incompatible == 0
+        assert excluded == ()
+
+
+class TestPlatformFiltering:
+    """Releases with no distribution that could install here cost no probe."""
+
+    def test_a_wheel_only_release_for_another_platform_is_excluded(self) -> None:
+        kept, excluded = filter_releases(
+            [release("1.1.0", files=["widget-1.1.0-cp38-cp38-win_amd64.whl"])],
+            tags=PURE_PYTHON_HOST,
+        )
+        assert kept == []
+        assert reasons(excluded) == [("1.1.0", PLATFORM)]
+        assert excluded[0].detail == "no distribution for this platform"
+
+    def test_an_sdist_only_release_is_kept(self) -> None:
+        # An sdist may well build here. "No compatible wheel" and "not
+        # installable" are different claims, and only the first is one
+        # depbisect can make from a filename.
+        kept, excluded = filter_releases(
+            [release("1.1.0", files=["widget-1.1.0.tar.gz"])],
+            tags=PURE_PYTHON_HOST,
+        )
+        assert kept == ["1.1.0"]
+        assert excluded == ()
+
+    def test_one_usable_wheel_among_many_keeps_the_release(self) -> None:
+        kept, _ = filter_releases(
+            [
+                release(
+                    "1.1.0",
+                    files=[
+                        "widget-1.1.0-cp38-cp38-win_amd64.whl",
+                        "widget-1.1.0-cp313-cp313-manylinux_2_17_x86_64.whl",
+                        "widget-1.1.0-py3-none-any.whl",
+                    ],
+                )
+            ],
+            tags=PURE_PYTHON_HOST,
+        )
+        assert kept == ["1.1.0"]
+
+    def test_a_sdist_alongside_foreign_wheels_keeps_the_release(self) -> None:
+        kept, _ = filter_releases(
+            [
+                release(
+                    "1.1.0",
+                    files=["widget-1.1.0-cp38-cp38-win_amd64.whl", "widget-1.1.0.tar.gz"],
+                )
+            ],
+            tags=PURE_PYTHON_HOST,
+        )
+        assert kept == ["1.1.0"]
+
+    def test_no_tag_set_means_no_platform_filtering(self) -> None:
+        # tags=None is what an undescribable host produces, and it must
+        # behave exactly as this filter did before it existed.
+        kept, excluded = filter_releases(
+            [release("1.1.0", files=["widget-1.1.0-cp38-cp38-win_amd64.whl"])],
+            tags=None,
+        )
+        assert kept == ["1.1.0"]
+        assert excluded == ()
+
+    def test_an_unreadable_wheel_name_is_kept(self) -> None:
+        kept, _ = filter_releases(
+            [release("1.1.0", files=["widget-1.1.0-py3-none.whl"])],
+            tags=PURE_PYTHON_HOST,
+        )
+        assert kept == ["1.1.0"]
+
+    def test_requires_python_wins_the_bucket(self) -> None:
+        # One release, two reasons: it is reported under the first check
+        # that ruled it out, so the counts still sum to one per release.
+        kept, excluded = filter_releases(
+            [
+                release(
+                    "1.1.0",
+                    requires="<3.9",
+                    files=["widget-1.1.0-cp38-cp38-win_amd64.whl"],
+                )
+            ],
+            python=(3, 13, 0),
+            tags=PURE_PYTHON_HOST,
+        )
+        assert kept == []
+        assert reasons(excluded) == [("1.1.0", PYTHON)]
+
+    def test_only_the_files_this_interpreter_accepts_can_save_a_release(self) -> None:
+        # The universal wheel is for an interpreter this host is not, so
+        # the only file left is the Windows one: nothing to install.
+        kept, excluded = filter_releases(
+            [
+                Release(
+                    version="1.1.0",
+                    files=(
+                        DistFile("widget-1.1.0-py3-none-any.whl", False, "<3.9"),
+                        DistFile("widget-1.1.0-cp38-cp38-win_amd64.whl", False, ">=3.13"),
+                    ),
+                )
+            ],
+            python=(3, 13, 0),
+            tags=PURE_PYTHON_HOST,
+        )
+        assert kept == []
+        assert reasons(excluded) == [("1.1.0", PLATFORM)]
+
+    def test_the_path_and_counts_reflect_the_exclusion(self) -> None:
+        result = build_candidates(
+            "widget",
+            "1.0.0",
+            "2.0.0",
+            online=True,
+            tags=PURE_PYTHON_HOST,
+            fetch=fetcher(
+                [
+                    release("1.1.0"),
+                    release("1.5.0", files=["widget-1.5.0-cp38-cp38-win_amd64.whl"]),
+                ]
+            ),
+        )
+        assert result.path == ["1.0.0", "1.1.0", "2.0.0"]
+        assert result.excluded_platform == 1
+        assert result.describe_exclusions(platform="macosx_15_0_arm64") == (
+            "Excluded from the index list: 1 with no distribution for this platform "
+            "(macosx_15_0_arm64)"
+        )
+
+    def test_local_wheels_are_never_platform_filtered(self, tmp_path: Path) -> None:
+        # The rule the whole module is built on: a file you pointed at is
+        # a version you chose, whatever its tags say.
+        d = tmp_path / "w"
+        d.mkdir()
+        (d / "widget-1.5.0-cp38-cp38-win_amd64.whl").write_bytes(b"")
+        result = build_candidates("widget", "1.0.0", "2.0.0", find_links=[d], tags=PURE_PYTHON_HOST)
+        assert result.path == ["1.0.0", "1.5.0", "2.0.0"]
+        assert result.excluded == 0
 
 
 class TestIndexFailureDegrades:

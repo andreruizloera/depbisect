@@ -6,7 +6,11 @@ Honest future work, none of it implemented yet.
 
 Shipped: `--online` reads the simple repository API (PEP 691 JSON or
 PEP 503 HTML) for the releases between good and bad, filtered by
-pre-release status, yanked status, and `Requires-Python`. Still open:
+pre-release status, yanked status, `Requires-Python`, and PEP 425 wheel
+tags against the interpreter the trials run under. A release whose
+every distribution is a wheel for another platform is excluded before
+the search starts; an sdist-only release is never excluded, because it
+may build. Still open:
 
 - An npm registry client, so `--online` works for Node projects too.
   The candidate path and the search are already ecosystem-agnostic;
@@ -16,10 +20,6 @@ pre-release status, yanked status, and `Requires-Python`. Still open:
   guarantee.
 - Cache index responses on disk with a short expiry, so re-running a
   bisection on the same package does not re-fetch the listing.
-- Bisect only the releases that actually have an installable
-  distribution for this platform, by reading wheel tags from the index
-  listing rather than discovering it one failed install at a time. That
-  would turn most skips into exclusions, which cost no test run.
 - Authenticated and mirrored indexes: honour `PIP_INDEX_URL`,
   `UV_INDEX_URL`, and netrc credentials instead of requiring
   `--index-url` explicitly.

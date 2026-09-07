@@ -7,7 +7,7 @@ import pytest
 
 from depbisect import candidates
 from depbisect.cli import main
-from depbisect.index import IndexError_, Release
+from depbisect.index import DistFile, IndexError_, Release
 from depbisect.sandbox import TrialOutcome, Workspace
 
 
@@ -252,8 +252,10 @@ def stub_index(monkeypatch, releases: list[Release] | Exception) -> None:
     monkeypatch.setattr(candidates, "fetch_releases", fetch)
 
 
-def rel(version: str, **kwargs: object) -> Release:
-    return Release(version=version, yanked=bool(kwargs.get("yanked", False)))
+def rel(version: str, *, yanked: bool = False, filename: str | None = None) -> Release:
+    """An index release publishing one file, a universal wheel by default."""
+    name = filename or f"brokenlib-{version}-py3-none-any.whl"
+    return Release(version=version, files=(DistFile(name, yanked, None),))
 
 
 class TestVersionsSubcommand:
@@ -284,8 +286,35 @@ class TestVersionsSubcommand:
         out = capsys.readouterr().out
         assert code == 0
         assert "source: index https://pypi.org/simple/" in out
-        assert "1 pre-release(s)" in out and "1 yanked" in out
-        assert "1.5.0rc1" not in out
+        # Every filtered release is named here, with the reason and the
+        # flag that would put it back: this command exists to show the
+        # candidate path AND what is missing from it.
+        assert "Not bisected (2):" in out
+        assert "1.5.0rc1  pre-release (--pre to include)" in out
+        assert "1.7.0     yanked (--include-yanked to include)" in out
+        assert "3 candidate version(s)" in out  # 1.0.0, 1.1.0, 2.0.0
+
+    def test_a_release_with_no_distribution_for_this_platform_is_named(
+        self, monkeypatch, capsys
+    ) -> None:
+        stub_index(
+            monkeypatch,
+            [rel("1.1.0"), rel("1.5.0", filename="brokenlib-1.5.0-cp38-cp38-win_amd64.whl")],
+        )
+        code = main(["versions", "brokenlib", "--from", "1.0.0", "--to", "2.0.0", "--online"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "1.5.0  no distribution for this platform" in out
+        assert "this platform:" in out
+        assert "3 candidate version(s)" in out
+
+    def test_an_sdist_only_release_stays_a_candidate(self, monkeypatch, capsys) -> None:
+        stub_index(monkeypatch, [rel("1.5.0", filename="brokenlib-1.5.0.tar.gz")])
+        code = main(["versions", "brokenlib", "--from", "1.0.0", "--to", "2.0.0", "--online"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Not bisected" not in out
+        assert "3 candidate version(s)" in out
 
     def test_pre_flag_admits_prereleases(self, monkeypatch, capsys) -> None:
         stub_index(monkeypatch, [rel("1.5.0rc1")])

@@ -150,6 +150,9 @@ cannot answer the question:
   interpreter it is running under, so this is a fact about the run and
   not a guess. On Python 3.13, bisecting numpy 1.19.0 to 1.26.0 drops
   the five 1.21.x releases that declare `>=3.7,<3.11`.
+- **Releases with no distribution that could install on this platform
+  are excluded**, read out of the wheel filenames in the listing. See
+  below.
 - **Filtering never applies to `--find-links`.** A wheel you put in a
   directory is a version you chose; depbisect does not second-guess it.
 
@@ -157,23 +160,70 @@ Every count is reported, and it counts only releases inside the
 good-to-bad interval, so "5 not compatible" is a fact about this
 bisection rather than about the project's whole history.
 
-### A release that will not install is skipped, never blamed
+### A release that cannot install here is excluded, or skipped, never blamed
 
-Metadata does not catch everything: a release can declare a compatible
-`Requires-Python` and still have no installable distribution for your
-platform. Naively, that install failure is indistinguishable from a
-test failure, and the bisection blames a release it never actually
-ran. depbisect treats "could not install" as a third answer:
+Two different things hide behind "this release will not install", and
+depbisect answers them differently.
+
+The first one the index listing already settles. A wheel filename
+states the interpreters, ABIs, and platforms the wheel was built for
+(PEP 425), so a release whose every distribution is a wheel for some
+other platform can be dropped before the search starts. It costs no
+test run and it does not become a gap in the boundary:
 
 ```text
-bisect:   brokenlib==1.2.0 ... PASS
-bisect:   brokenlib==1.5.0 ... SKIP (will not install here)
+$ depbisect versions brokenlib --from 1.0.0 --to 2.0.0 --online
+brokenlib: 5 candidate version(s) to bisect (source: index http://127.0.0.1:52554/simple/)
 
+  1.0.0  (good)
+  1.1.0
+  1.2.0
+  1.6.0
+  2.0.0  (bad)
+
+  Not bisected (1):
+    1.5.0  no distribution for this platform
+    (this platform: macosx_15_0_arm64, Python 3.13.14)
+
+  Bisection would need at most 2 test run(s).
+```
+
+brokenlib 1.5.0 is published at that index as a Windows-only CPython
+3.8 wheel. The tag set it is compared against is computed from the
+interpreter depbisect is running under, which is the interpreter the
+trial virtualenv is created with, so this is a fact about the run and
+not a guess about the machine. `depbisect versions` names every release
+it filtered out and why, since showing the candidate path is the entire
+job of that command.
+
+The second one no filename can settle. brokenlib 1.6.0 publishes only a
+source distribution, and an sdist may well build here: "no compatible
+wheel" and "not installable" are different claims, and only the first
+is readable from a listing. So 1.6.0 stays a candidate and gets probed.
+Its build fails, and that is a third answer rather than a test failure,
+because otherwise the bisection would blame a release it never ran:
+
+```text
+$ depbisect run --test "python test_app.py" --online
+baseline: testing bad dependency state ... FAIL
+baseline: testing good dependency state ... PASS
+subset:   reverting {brokenlib} ... PASS
+bisect:   brokenlib==1.2.0 ... PASS
+bisect:   brokenlib==1.6.0 ... SKIP (will not install here)
+
+Dependency regression isolated
+
+  Package:       brokenlib
   Last passing:  1.2.0
   First failing: 2.0.0
+  Test:          python test_app.py
+  Runs:          5
+  Searched:      5 version(s), candidates from the package index
 
-  note: 1 release between 1.2.0 and 2.0.0 could not be installed here and was skipped rather than blamed: 1.5.0
+  note: 1 release between 1.2.0 and 2.0.0 could not be installed here and was skipped rather than blamed: 1.6.0
         the boundary above is therefore not tight.
+
+  note: excluded from the index list: 1 with no distribution for this platform (macosx_15_0_arm64)
 ```
 
 The search steps to the nearest usable neighbour instead, and any
@@ -297,6 +347,8 @@ src/depbisect/
                 discovery from local wheel directories
   specifiers.py Requires-Python evaluation (the PEP 440 operator subset
                 that appears in real metadata), pure
+  tags.py       PEP 425 compatibility tags: wheel-filename tag parsing
+                and the tag set of the running interpreter, pure
   index.py      the only module that touches the network: simple
                 repository API client, PEP 691 JSON and PEP 503 HTML
   candidates.py composes local and index candidates into the path a
@@ -320,11 +372,24 @@ culprit over whatever candidate list is derivable offline.
   candidate versions still come from `--find-links` alone. Without
   either source depbisect bisects between the two known versions only,
   and the report says so.
-- **A skipped release leaves a real gap.** When a candidate cannot be
-  installed, depbisect reports the boundary it could reach and names
-  what it could not test. That boundary is honest, but it is wider
-  than a fully-tested one, and the breaking change may be inside the
-  gap.
+- **A skipped release still leaves a real gap.** Wheel tags take the
+  releases that could never have installed here out of the search
+  before it starts, but they cannot speak for a source distribution: an
+  sdist may build or may not, and depbisect only finds out by trying.
+  When a candidate cannot be installed, depbisect reports the boundary
+  it could reach and names what it could not test. That boundary is
+  honest, but it is wider than a fully-tested one, and the breaking
+  change may be inside the gap.
+- **Wheel-tag filtering reads filenames, not wheels.** The supported
+  tag set is computed from the running interpreter and compared with
+  what each filename declares, so a release is excluded only when every
+  distribution it published is a wheel tagged for another platform. Two
+  deliberate holes stop that from deleting real candidates: an sdist,
+  or a filename that does not parse, is always kept; and a host whose
+  platform tags depbisect cannot work out (a musl system, mostly)
+  excludes nothing at all and falls back to probing. Like
+  `Requires-Python` filtering this has no override flag, and like every
+  other filter it never touches `--find-links`.
 - **`Requires-Python` filtering trusts the index's metadata.** A
   release whose declared support is wrong (too generous or too strict)
   is filtered on what it declared, not on what it does. A wrongly
