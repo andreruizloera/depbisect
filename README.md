@@ -21,11 +21,12 @@ cd depbisect
 ./demo.sh
 ```
 
-The demo runs fully offline and has five parts: local wheels, a local
-package index, a full online bisection against it, a Poetry lockfile,
-and a Node project against a local npm registry (that part needs npm on
-PATH). The first breaks a tiny app with a bad dependency bump and lets
-depbisect find the culprit:
+The demo runs fully offline and has six parts: local wheels, a local
+package index, a full online bisection against it, a Poetry lockfile, a
+Node project against a local npm registry, and the same Node project
+with no registry, from `npm pack` tarballs (the two Node parts need npm
+on PATH). The first breaks a tiny app with a bad dependency bump and
+lets depbisect find the culprit:
 
 ```text
 $ cat requirements.txt
@@ -59,19 +60,23 @@ releases between 1.0.0 and 2.0.0 to the exact breaking one. And
 $ depbisect run --test "python test_app.py" --find-links examples/demo/wheels --dry-run
 depbisect plan (dry run)
 
-  Project:   /tmp/demo-app (python)
+  Project:   /private/var/folders/.../demo-app (python)
   Manifest:  requirements.txt
-  Good ref:  e69331ea55d5da3eaa365584e8ec0327c8f15247 (e69331e)
+  Good ref:  74874aff1bb1c7f91e974b79699936806d678f14 (74874af)
   Bad state: working tree
   Test:      python test_app.py
 
   Changed dependencies (2):
-    brokenlib  1.0.0 -> 2.0.0   (2 intermediate version(s) available locally)
-    okpkg      1.0.0 -> 1.1.0   (no intermediate versions found locally)
+    brokenlib  1.0.0 -> 2.0.0   (2 intermediate release(s) found locally)
+    okpkg      1.0.0 -> 1.1.0   (no intermediate versions found)
 
   Estimated test runs: 4 to 14
   Dry run: nothing was installed and no files were modified.
 ```
+
+That plan is not part of `./demo.sh`; it was run by hand on a copy of
+`examples/demo/project` with the same bump, and the commit hash and
+path differ on every run.
 
 ## Online mode: bisect every published release
 
@@ -211,6 +216,7 @@ because otherwise the bisection would blame a release it never ran:
 
 ```text
 $ depbisect run --test "python test_app.py" --online
+workspace: /var/folders/.../depbisect-9u0hr8qh/project (your project is not touched)
 baseline: testing bad dependency state ... FAIL
 baseline: testing good dependency state ... PASS
 subset:   reverting {brokenlib} ... PASS
@@ -341,6 +347,53 @@ The `depbisect run` that follows tests 1.2.0 and 1.3.0 and nothing else,
 and reports 1.3.0 as the first failing release in four runs. With an
 explicit `--index-url`, trial installs come from that registry too.
 
+### Offline: candidates from `npm pack` tarballs
+
+Point `--find-links` at a directory of tarballs and a Node bisection
+needs no registry for the package it bisects. depbisect opens each
+`.tgz` whose filename starts the way `npm pack` names that package
+(`padstr-`, or `scope-pkg-` for `@scope/pkg`) and reads the name and
+version from the `package.json` inside, because a package name and a
+semver version can both contain dashes and a filename alone cannot be
+split. A trial whose pin a tarball holds gets a `file:` spec in the
+copy's `package.json`, which npm installs from that file.
+
+Part 6 of `./demo.sh` packs padstr's releases with `npm pack` and
+bisects them with `--no-index` and an empty npm cache, so every install
+that succeeds came from a tarball:
+
+```text
+$ ls packs
+padstr-1.0.0.tgz
+padstr-1.1.0.tgz
+padstr-1.2.0.tgz
+padstr-1.3.0.tgz
+padstr-2.0.0.tgz
+
+$ depbisect run --test "node test.js" --no-index --find-links packs
+workspace: /var/folders/.../depbisect-serteki0/project (your project is not touched)
+baseline: testing bad dependency state ... FAIL
+baseline: testing good dependency state ... PASS
+bisect:   padstr@1.2.0 ... PASS
+bisect:   padstr@1.3.0 ... FAIL
+
+Dependency regression isolated
+
+  Package:       padstr
+  Last passing:  1.2.0
+  First failing: 1.3.0
+  Test:          node test.js
+  Runs:          4
+  Searched:      5 version(s), candidates from local tarballs
+```
+
+For a Node project `--no-index` runs `npm install --offline`. That is
+npm's nearest switch to "only these files" and it is not the same
+thing: npm still installs anything already in its cache. What it does
+guarantee is that nothing is fetched, so a tarball whose own
+dependencies are not cached fails to install at once instead of after
+npm's retries.
+
 ## Why?
 
 `git bisect` finds the commit that broke your code, but a dependency
@@ -381,6 +434,9 @@ depbisect run --good-ref HEAD~20 --bad-ref HEAD --test "pytest"
 depbisect run --test "npm test"
 depbisect run --test "npm test" --online
 
+# Node, offline, candidates and installs from a directory of npm pack tarballs:
+depbisect run --test "npm test" --no-index --find-links ./packs
+
 # See the plan without installing or running anything:
 depbisect run --test "pytest" --dry-run
 
@@ -401,12 +457,12 @@ Options for `depbisect run`:
 | `--bad-ref REF` | git ref of the known-bad state (default: working tree) |
 | `-C, --directory DIR` | project directory (default: `.`) |
 | `--dry-run` | print changed deps, candidates, and a run estimate; mutate nothing |
-| `--find-links DIR` | local wheel/sdist directory; install source and offline candidate list (repeatable) |
+| `--find-links DIR` | local wheel/sdist directory, or `npm pack` tarballs for a Node project; install source and offline candidate list (repeatable) |
 | `--online` | query the package index, or the npm registry for a Node project, for candidate releases (off by default) |
 | `--index-url URL` | simple-index or npm registry base URL for `--online` and for installs (default `https://pypi.org/simple/`, or `https://registry.npmjs.org/` for a Node project, whose installs then use npm's own configuration) |
 | `--pre` | include pre-releases from the index |
 | `--include-yanked` | include yanked releases from the index (Python only) |
-| `--no-index` | never touch the package index; install only from `--find-links` |
+| `--no-index` | never touch the package index; install only from `--find-links` (a Node project runs `npm install --offline`, which also installs from npm's cache) |
 | `--timeout SECONDS` | per-command timeout (default 600) |
 | `--keep-temp` | keep the temporary workspace for inspection |
 | `--verbose` | stream install and test output |
@@ -429,7 +485,7 @@ does not change the search:
 $ depbisect run --test "python test_app.py" --find-links examples/demo/wheels --dry-run
 depbisect plan (dry run)
 
-  Project:   /var/folders/.../poetry-project (python)
+  Project:   /private/var/folders/.../poetry-project (python)
   Manifest:  poetry.lock
   Good ref:  bd50e2ab53461db0c62140aa1da616a50762f9c6 (bd50e2a)
   Bad state: working tree
@@ -466,9 +522,10 @@ reads the response as text; nothing is executed and nothing is written
 to disk. For a Node project it also runs `node -e` once, with a fixed
 script, to learn the platform npm will check. Installs are a separate
 matter: `pip` and `npm` reach the network by default as they always
-have. `--no-index --find-links DIR` is the way to forbid that for a
-Python project; a Node project has no equivalent short of an
-`--index-url` registry you run yourself.
+have. `--no-index --find-links DIR` is the way to forbid that. A Python
+trial passes `--no-index` to the installer; a Node trial runs `npm
+install --offline`, which fetches nothing but does install from npm's
+own cache.
 
 ## Architecture
 
@@ -486,6 +543,8 @@ src/depbisect/
   versions.py   dependency-free version parser/comparator (PEP 440 and
                 semver shapes), distribution-filename parsing, candidate
                 discovery from local wheel directories
+  tarballs.py   npm pack tarballs in a --find-links directory, named by
+                the package.json inside each one
   specifiers.py Requires-Python evaluation (the PEP 440 operator subset
                 that appears in real metadata), pure
   tags.py       PEP 425 compatibility tags: wheel-filename tag parsing
@@ -507,17 +566,33 @@ never install anything.
 
 A session is: two baseline runs (bad state must fail, good state must
 pass), then subset minimization, then version bisection of the single
-culprit over the candidates found in local wheels and, with `--online`,
+culprit over the candidates found in local wheels or tarballs and, with `--online`,
 at the index or registry.
 
 ## Limitations
 
-- **`--find-links` supplies no Node candidates.** An `npm pack` tarball
-  (`name-version.tgz`) is not read as a distribution filename, and Node
-  trials never point npm at the directory, so for a Node project the
-  only source of intermediate releases is `--online`. Without it
-  depbisect bisects between the two known versions only, and the report
-  says so.
+- **A Node trial pins only the project's direct dependencies.** Trial
+  pins are written into the copy's `package.json`, and a package that
+  appears only in the lockfile has no entry there to rewrite, so its
+  candidate version is not applied and npm resolves it as it likes.
+  Measured on the code: trial pins for `chalk` and a transitive
+  `ansi-styles` wrote `chalk` alone. What that does to a bisection whose
+  culprit is transitive was not measured.
+- **A Node tarball supplies its package, not that package's
+  dependencies.** npm still resolves those from a registry or its cache.
+  Under `--no-index` a dependency in neither fails to install at once;
+  without it npm goes looking, and against a registry it could not
+  reach, npm 11.6.0 retried for 140 seconds before failing.
+- **`--no-index` for a Node project is npm's `--offline`, not "only these
+  tarballs".** Nothing is fetched, but a package already in npm's cache
+  still installs. Part 6 of the demo uses an empty cache so that its
+  passing trials can only have come from the tarballs.
+- **Node tarballs are found by the name `npm pack` gives them.** Only a
+  `.tgz` whose filename starts with the package's `npm pack` prefix
+  (`padstr-`, or `scope-pkg-` for `@scope/pkg`) is opened, and the name
+  and version are then read from the `package.json` inside. A tarball
+  renamed to anything else is not seen, and one whose manifest cannot
+  be read is skipped without a message.
 - **Without `--index-url`, a Node project's candidates and installs can
   come from different registries.** Candidates are read from
   registry.npmjs.org, while `npm install` uses whatever registry npm is
@@ -569,7 +644,9 @@ at the index or registry.
   selection) gets the pins and not those semantics.
 - Node trials run `npm install` in the copy, which needs a registry:
   the public one, npm's configured one, or one you serve yourself and
-  name with `--index-url`, as part 5 of the demo does.
+  name with `--index-url`, as part 5 of the demo does. The exception is
+  an install every package of which is a `--find-links` tarball or
+  already cached, as in part 6.
 - Assumes a single pass/fail boundary; flaky tests will mislead any
   bisection, this one included.
 

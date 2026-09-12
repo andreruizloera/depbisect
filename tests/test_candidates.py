@@ -99,6 +99,26 @@ class TestOfflineIsUnchanged:
 
         build_candidates("widget", "1.0.0", "2.0.0", fetch=explode)
 
+    def test_a_node_package_reads_tarballs_and_not_wheels(
+        self, tmp_path: Path, write_package
+    ) -> None:
+        d = tmp_path / "links"
+        d.mkdir()
+        (d / "widget-1.1.0-py3-none-any.whl").write_bytes(b"")
+        write_package(d / "widget-1.2.0.tgz", "widget", "1.2.0")
+        # Local pre-releases are never filtered, for Node exactly as for Python.
+        write_package(d / "widget-1.3.0-rc.1.tgz", "widget", "1.3.0-rc.1")
+        result = build_candidates("widget", "1.0.0", "2.0.0", ecosystem="node", find_links=[d])
+        assert result.path == ["1.0.0", "1.2.0", "1.3.0-rc.1", "2.0.0"]
+        assert result.source == "local"
+
+    def test_a_python_package_never_reads_a_tarball(self, tmp_path: Path, write_package) -> None:
+        d = tmp_path / "links"
+        write_package(d / "widget-1.2.0.tgz", "widget", "1.2.0")
+        result = build_candidates("widget", "1.0.0", "2.0.0", find_links=[d])
+        assert result.path == ["1.0.0", "2.0.0"]
+        assert result.source == "none"
+
 
 class TestOnline:
     def test_index_releases_become_candidates(self) -> None:

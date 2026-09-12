@@ -20,6 +20,7 @@ from pathlib import Path
 
 from depbisect.errors import DepbisectError
 from depbisect.manifests import render_package_json, render_requirements
+from depbisect.tarballs import local_tarballs
 
 
 class TrialOutcome(enum.Enum):
@@ -73,6 +74,8 @@ class Workspace:
         self.root: Path | None = None
         self.last_install_error: str | None = None
         self._original_package_json: str | None = None
+        #: package name -> {version: tarball}, filled the first time a pin asks.
+        self._tarballs: dict[str, dict[str, Path]] = {}
 
     # -- lifecycle -----------------------------------------------------
 
@@ -140,21 +143,46 @@ class Workspace:
             (self.copy_dir / TRIAL_REQUIREMENTS).write_text(render_requirements(pins))
         else:
             assert self._original_package_json is not None
+            specs = {name: self._node_spec(name, version) for name, version in pins.items()}
             (self.copy_dir / "package.json").write_text(
-                render_package_json(self._original_package_json, pins)
+                render_package_json(self._original_package_json, specs)
             )
             lock = self.copy_dir / "package-lock.json"
             if lock.exists():
                 lock.unlink()  # inside the copy only; npm regenerates it
 
+    def _node_spec(self, name: str, version: str) -> str:
+        """What the trial package.json asks npm for, for one pin.
+
+        A ``--find-links`` tarball holding exactly this version becomes a
+        ``file:`` spec, which npm installs from the tarball without asking
+        a registry for that package. The tarball's own dependencies still
+        come from wherever npm finds them.
+        """
+        if not self.find_links:
+            return version
+        if name not in self._tarballs:
+            self._tarballs[name] = local_tarballs(name, self.find_links)
+        tarball = self._tarballs[name].get(version)
+        return f"file:{tarball}" if tarball is not None else version
+
     def _install(self, pins: dict[str, str]) -> Path | None:
         if self.ecosystem == "node":
-            # An explicit --index-url is the registry the candidates were
-            # read from, so the installs come from it too. Without one,
-            # npm uses whatever registry it is configured with.
-            registry = ["--registry", self.index_url] if self.index_url else []
+            if self.no_index:
+                # npm has no switch meaning "only these tarballs". --offline
+                # is the nearest: nothing is fetched, so a package that is
+                # neither a file: tarball nor already in npm's cache fails
+                # at once, instead of after npm's retries against a registry.
+                source = ["--offline"]
+            elif self.index_url:
+                # An explicit --index-url is the registry the candidates were
+                # read from, so the installs come from it too.
+                source = ["--registry", self.index_url]
+            else:
+                # Without one, npm uses whatever registry it is configured with.
+                source = []
             self._run(
-                ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error", *registry],
+                ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error", *source],
                 cwd=self.copy_dir,
                 what="npm install",
             )

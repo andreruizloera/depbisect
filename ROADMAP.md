@@ -15,12 +15,18 @@ may build.
 Shipped: `--online` for Node projects reads the npm registry's
 abbreviated package document, filtered by semver pre-release status and
 by the `os`, `cpu` and `libc` lists npm enforces, with deprecated
-releases kept and named. Still open:
+releases kept and named.
 
-- `--find-links` for Node. It supplies no Node candidates today: an
-  `npm pack` tarball (`name-version.tgz`) is not recognised as a
-  distribution filename, and Node trials never point npm at the
-  directory. Both halves are needed for an offline Node bisection.
+Shipped: `--find-links` for Node. `npm pack` tarballs are read as
+candidates, named by the `package.json` inside each one, a trial pin a
+tarball holds is installed from it through a `file:` spec, and
+`--no-index` runs `npm install --offline`. Still open:
+
+- Pin a transitive Node dependency in a trial. Pins are written into
+  `package.json`, so a package that appears only in the lockfile keeps
+  whatever npm resolves. npm's `overrides` field is the likely route.
+- Warn when a `--find-links` tarball named like a candidate cannot be
+  read, instead of skipping it silently.
 - Read the registry npm is configured with (`.npmrc`,
   `npm_config_registry`) when `--index-url` is not given, instead of
   defaulting to registry.npmjs.org while the trial installs use npm's

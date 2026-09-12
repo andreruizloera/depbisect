@@ -1,8 +1,9 @@
 """Assemble the candidate version path for one dependency.
 
-This is where the candidate sources meet: local distribution
-directories (``--find-links``, always available, never networked) and,
-with ``--online``, the package index for a Python project or the npm
+This is where the candidate sources meet: local directories
+(``--find-links``, always available, never networked: wheels and sdists
+for a Python project, ``npm pack`` tarballs for a Node one) and, with
+``--online``, the package index for a Python project or the npm
 registry for a Node one. The result is the ordered path the bisector
 will walk, plus an account of what was left out and why, so the report
 can say what was searched instead of implying it searched everything.
@@ -18,8 +19,9 @@ its ``os``, ``cpu`` or ``libc`` lists rule this host out. A deprecated
 release is kept, and so is one whose ``engines`` this Node does not
 satisfy, because npm installs both; npm.py has the reasons.
 
-Filtering applies to INDEX and REGISTRY candidates only. A wheel sitting
-in a directory you pointed at is a version you chose deliberately, so
+Filtering applies to INDEX and REGISTRY candidates only. A wheel or
+tarball sitting in a directory you pointed at is a version you chose
+deliberately, so
 depbisect does not second-guess it; a release the index happens to list
 is not. That also means behaviour with no ``--online`` is exactly what
 it was before index support existed.
@@ -34,6 +36,7 @@ from pathlib import Path
 from depbisect.index import DEFAULT_INDEX_URL, IndexError_, Release, fetch_releases
 from depbisect.npm import DEFAULT_REGISTRY_URL, NpmHost, NpmRelease, fetch_npm_releases
 from depbisect.tags import Tag
+from depbisect.tarballs import local_tarballs
 from depbisect.versions import (
     VersionParseError,
     local_versions,
@@ -184,7 +187,13 @@ def build_candidates(
     ``python`` and ``tags`` filter a Python index listing; ``npm_host``
     filters an npm registry listing. Each is ignored for the other.
     """
-    local = local_versions(package, list(find_links or []))
+    links = list(find_links or [])
+    # Each ecosystem reads only its own kind of file: a wheel is never a
+    # Node candidate and a tarball is never a Python one.
+    if ecosystem == "node":
+        local = list(local_tarballs(package, links))
+    else:
+        local = local_versions(package, links)
     from_index: list[str] = []
     excluded: tuple[Excluded, ...] = ()
     deprecated: frozenset[str] = frozenset()

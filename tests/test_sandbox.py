@@ -1,8 +1,12 @@
 """The safety layer: the user's project must come out byte-identical."""
 
 import hashlib
+import json
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from depbisect.errors import DepbisectError
 from depbisect.sandbox import TRIAL_REQUIREMENTS, TrialOutcome, Workspace
@@ -321,6 +325,62 @@ class TestNodeRegistryInstalls:
         finally:
             server.shutdown()
             server.server_close()
+        assert tree_digest(project) == before
+
+
+class TestNodeTarballInstalls:
+    def test_a_pin_a_tarball_holds_is_installed_from_that_tarball(
+        self, tmp_path: Path, monkeypatch, write_package
+    ) -> None:
+        packs = tmp_path / "packs"
+        tarball = write_package(packs / "widget-1.1.0.tgz", "widget", "1.1.0")
+        project = make_node_project(tmp_path, "widget", "2.0.0")
+        monkeypatch.setattr(Workspace, "_run", lambda self, cmd, *, cwd, what: None)
+        with Workspace(project, "node", find_links=[packs]) as ws:
+            ws.try_trial({"widget": "1.1.0"}, "true")
+            held = json.loads((ws.copy_dir / "package.json").read_text())["dependencies"]
+            ws.try_trial({"widget": "1.0.0"}, "true")
+            not_held = json.loads((ws.copy_dir / "package.json").read_text())["dependencies"]
+        assert held == {"widget": f"file:{tarball.resolve()}"}
+        # No tarball holds 1.0.0, so npm is asked for the version as before.
+        assert not_held == {"widget": "1.0.0"}
+
+    def test_no_index_runs_npm_offline(self, tmp_path: Path, monkeypatch) -> None:
+        project = make_node_project(tmp_path, "widget", "2.0.0")
+        commands: list[list[str]] = []
+        monkeypatch.setattr(Workspace, "_run", lambda self, cmd, *, cwd, what: commands.append(cmd))
+        with Workspace(project, "node", no_index=True) as ws:
+            assert ws.try_trial({"widget": "1.0.0"}, "true") is TrialOutcome.PASS
+        assert commands == [[*NPM_INSTALL, "--offline"]]
+
+    def test_an_offline_node_trial_installs_from_tarballs_alone(
+        self, tmp_path: Path, monkeypatch, write_package
+    ) -> None:
+        """Real npm, --no-index, an empty npm cache, and a registry that refuses connections.
+
+        Nothing but the tarballs can supply a package here, so a trial that
+        passes proves the tarball was installed, and the two versions carry
+        different code so each trial proves WHICH tarball.
+        """
+        if shutil.which("npm") is None:
+            pytest.skip("needs npm on PATH")
+        packs = tmp_path / "packs"
+        write_package(packs / "tinypad-1.0.0.tgz", "tinypad", "1.0.0", "module.exports = 'one';\n")
+        write_package(packs / "tinypad-1.1.0.tgz", "tinypad", "1.1.0", "module.exports = 'two';\n")
+        monkeypatch.setenv("npm_config_cache", str(tmp_path / "empty-npm-cache"))
+        monkeypatch.setenv("npm_config_registry", "http://127.0.0.1:9/")
+        monkeypatch.setenv("npm_config_update_notifier", "false")
+
+        project = make_node_project(tmp_path, "tinypad", "1.1.0")
+        (project / "check.js").write_text("process.exit(require('tinypad') === 'one' ? 0 : 1);\n")
+        before = tree_digest(project)
+        with Workspace(project, "node", no_index=True, find_links=[packs], timeout=120) as ws:
+            assert ws.try_trial({"tinypad": "1.0.0"}, "node check.js") is TrialOutcome.PASS
+            assert ws.try_trial({"tinypad": "1.1.0"}, "node check.js") is TrialOutcome.FAIL
+            # A version no tarball holds cannot come from anywhere, and
+            # --offline makes npm say so at once rather than retry a registry.
+            assert ws.try_trial({"tinypad": "9.9.9"}, "node check.js") is TrialOutcome.UNINSTALLABLE
+            assert "ENOTCACHED" in (ws.last_install_error or "")
         assert tree_digest(project) == before
 
 

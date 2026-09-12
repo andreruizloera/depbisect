@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end demo of depbisect against a deliberately broken dependency
-# bump. Runs fully offline, in five parts:
+# bump. Runs fully offline, in six parts:
 #
 #   1. Local wheels only: the "package index" is a directory of wheels
 #      committed under examples/demo/wheels.
@@ -21,12 +21,16 @@
 #      installs. The registry lists a deprecated release, which stays a
 #      candidate, and a pre-release and an AIX-only release, which do
 #      not. Needs npm on PATH.
+#   6. The same Node project with no registry at all: padstr's releases
+#      are packed with `npm pack` into a directory, and the bisection runs
+#      with --no-index --find-links against an empty npm cache, so every
+#      install that succeeds came from a tarball.
 #
 # The scenario for parts 1 to 4: a demo app pins brokenlib==1.0.0 and
 # okpkg==1.0.0 (the committed, known-good state). Someone bumps both pins
 # in the working tree (brokenlib -> 2.0.0, okpkg -> 1.1.0) and the tests
 # start failing. depbisect figures out which package broke it, and at
-# which release. Part 5 is the same shape with padstr 1.0.0 -> 2.0.0.
+# which release. Parts 5 and 6 are the same shape with padstr 1.0.0 -> 2.0.0.
 #
 # Every line this script greps for is a line the README pastes. If the
 # tool's output drifts from the docs, this exits nonzero and CI fails.
@@ -309,4 +313,63 @@ if grep -qE "bisect:   padstr@1\.(4\.0-beta\.1|5\.0) " "$WORK/part5.txt"; then
 fi
 
 echo
-echo "demo: all five parts matched the output the README documents."
+echo "=============================================================="
+echo "Part 6: the same Node project offline, candidates from npm pack tarballs"
+echo "=============================================================="
+# padstr's five releases that install here, packed by npm itself: 1.0.0 to
+# 1.2.0 pad their input, 1.3.0 and 2.0.0 do not, as at the registry above.
+PACKS="$WORK/packs"
+mkdir -p "$PACKS"
+for version in 1.0.0 1.1.0 1.2.0 1.3.0 2.0.0; do
+    source_dir="$WORK/padstr-$version"
+    mkdir -p "$source_dir"
+    printf '{"name": "padstr", "version": "%s", "main": "index.js"}\n' "$version" \
+        >"$source_dir/package.json"
+    case "$version" in
+        1.3.0 | 2.0.0) body='String(text)' ;;
+        *) body='String(text).padStart(width)' ;;
+    esac
+    printf 'module.exports = (text, width) => %s;\n' "$body" >"$source_dir/index.js"
+    (cd "$source_dir" && npm pack --loglevel=error --pack-destination "$PACKS" >/dev/null)
+done
+echo "$ ls packs"
+ls "$PACKS" | tee "$WORK/part6-packs.txt"
+require "$WORK/part6-packs.txt" "padstr-1.0.0.tgz" "padstr-1.3.0.tgz" "padstr-2.0.0.tgz"
+
+# An empty cache: part 5 filled the first one from the local registry, and
+# a trial must not be able to pass by installing from it.
+export npm_config_cache="$WORK/npm-cache-offline"
+
+echo
+echo "$ depbisect run --test \"node test.js\" --no-index --find-links packs"
+"${DEPBISECT[@]}" run \
+    --test "node test.js" \
+    --no-index --find-links "$PACKS" 2>"$WORK/part6.err" | tee "$WORK/part6.txt" || {
+    # set -e would stop here without showing why, so show it first.
+    cat "$WORK/part6.err" >&2
+    echo "DEMO CHECK FAILED: the offline Node bisection exited nonzero" >&2
+    exit 1
+}
+cat "$WORK/part6.err" >&2
+require "$WORK/part6.txt" \
+    "baseline: testing bad dependency state ... FAIL" \
+    "baseline: testing good dependency state ... PASS" \
+    "bisect:   padstr@1.2.0 ... PASS" \
+    "bisect:   padstr@1.3.0 ... FAIL" \
+    "Dependency regression isolated" \
+    "Package:       padstr" \
+    "Last passing:  1.2.0" \
+    "First failing: 1.3.0" \
+    "Test:          node test.js" \
+    "Runs:          4" \
+    "Searched:      5 version(s), candidates from local tarballs"
+
+# A baseline counts a failed install as a failing test, with a warning. The
+# bad baseline's FAIL has to be the test's, not a tarball npm could not use.
+if grep -q "trial install failed" "$WORK/part6.err"; then
+    echo "DEMO CHECK FAILED: an offline trial could not install" >&2
+    exit 1
+fi
+
+echo
+echo "demo: all six parts matched the output the README documents."

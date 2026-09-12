@@ -72,13 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="DIR",
-        help="local directory of wheels/sdists used both as install source "
-        "and as the offline candidate-version list (repeatable)",
+        help="local directory of wheels/sdists, or of npm pack tarballs for a Node "
+        "project, used both as install source and as the offline candidate-version "
+        "list (repeatable)",
     )
     run.add_argument(
         "--no-index",
         action="store_true",
-        help="forbid the package index entirely; install only from --find-links",
+        help="forbid the package index entirely; install only from --find-links "
+        "(a Node project's installs run npm --offline, which also uses npm's cache)",
     )
     _add_index_options(run)
     run.add_argument(
@@ -116,7 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="DIR",
-        help="local directory of wheels/sdists to draw candidates from (repeatable)",
+        help="local directory of wheels/sdists, or of npm pack tarballs with "
+        "--ecosystem node, to draw candidates from (repeatable)",
     )
     _add_index_options(versions)
     versions.add_argument(
@@ -280,14 +283,20 @@ def _python_text() -> str:
     return ".".join(str(part) for part in TRIAL_PYTHON)
 
 
+def _local_label(ecosystem: str) -> str:
+    """What a --find-links directory supplies for this ecosystem, for a message."""
+    return "local tarballs" if ecosystem == "node" else "local wheels"
+
+
 def _source_phrase(candidates: CandidateSet, index_url: str) -> str:
     place = f"npm registry {index_url}" if candidates.ecosystem == "node" else f"index {index_url}"
+    local = _local_label(candidates.ecosystem)
     if candidates.source == "index":
         return f"source: {place}"
     if candidates.source == "index and local":
-        return f"source: {place} and local wheels"
+        return f"source: {place} and {local}"
     if candidates.source == "local":
-        return "source: local wheels"
+        return f"source: {local}"
     return "no intermediate releases found"
 
 
@@ -418,7 +427,7 @@ def _print_plan(
             if found.interior > 0:
                 where = {
                     "index": f"from {index}",
-                    "index and local": f"from {index} and local wheels",
+                    "index and local": f"from {index} and {_local_label(ecosystem)}",
                     "local": "found locally",
                 }[found.source]
                 line += f"   ({found.interior} intermediate release(s) {where})"
@@ -561,10 +570,11 @@ def _report_success(
     print(f"  Test:          {test_cmd}")
     print(f"  Runs:          {runs}")
     index = "the npm registry" if candidates.ecosystem == "node" else "the package index"
+    local = _local_label(candidates.ecosystem)
     sources = {
         "index": f"candidates from {index}",
-        "index and local": f"candidates from {index} and local wheels",
-        "local": "candidates from local wheels",
+        "index and local": f"candidates from {index} and {local}",
+        "local": f"candidates from {local}",
         "none": "no intermediate candidates",
     }
     print(f"  Searched:      {len(candidates.path)} version(s), {sources[candidates.source]}")

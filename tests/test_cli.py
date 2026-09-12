@@ -560,6 +560,57 @@ class TestNodeOnline:
         assert "source: index https://pypi.org/simple/" in capsys.readouterr().out
 
 
+class TestNodeFindLinks:
+    def test_versions_lists_local_tarballs_for_a_node_package(
+        self, tmp_path: Path, capsys, write_package
+    ) -> None:
+        packs = tmp_path / "packs"
+        write_package(packs / "widget-1.1.0.tgz", "widget", "1.1.0")
+        code = main(
+            [
+                "versions",
+                "widget",
+                "--from",
+                "1.0.0",
+                "--to",
+                "2.0.0",
+                "--ecosystem",
+                "node",
+                "--find-links",
+                str(packs),
+            ]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "widget: 3 candidate version(s) to bisect (source: local tarballs)" in out
+        assert "  1.1.0\n" in out
+
+    def test_a_node_run_bisects_over_local_tarballs(
+        self, node_project: Path, tmp_path: Path, capsys, monkeypatch, write_package
+    ) -> None:
+        packs = tmp_path / "packs"
+        for version in ("1.1.0", "1.2.0"):
+            write_package(packs / f"widget-{version}.tgz", "widget", version)
+        monkeypatch.setattr(Workspace, "try_trial", fake_trials({"widget": "1.2.0"}))
+        code = main(
+            [
+                "run",
+                "--test",
+                "npm test",
+                "-C",
+                str(node_project),
+                "--no-index",
+                "--find-links",
+                str(packs),
+            ]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "bisect:   widget@1.1.0 ... PASS" in out
+        assert "First failing: 1.2.0" in out
+        assert "Searched:      4 version(s), candidates from local tarballs" in out
+
+
 class TestOnlineSession:
     def test_index_candidates_tighten_the_boundary(
         self, project: Path, capsys, monkeypatch
