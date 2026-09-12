@@ -229,3 +229,137 @@ class TestTrialOutcome:
             monkeypatch.setattr(ws, "_install", lambda pins: None)
             assert ws.try_trial({}, "true") is TrialOutcome.PASS
             assert ws.try_trial({}, "false") is TrialOutcome.FAIL
+
+
+def make_node_project(tmp_path: Path, dependency: str, version: str) -> Path:
+    project = tmp_path / "nodeproj"
+    project.mkdir()
+    (project / "package.json").write_text(
+        f'{{"name": "app", "version": "1.0.0", "dependencies": {{"{dependency}": "{version}"}}}}\n'
+    )
+    return project
+
+
+NPM_INSTALL = ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error"]
+
+
+class TestNodeRegistryInstalls:
+    def test_an_explicit_index_url_is_the_registry_npm_installs_from(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The candidates were read from that URL, so the installs must come
+        # from it too; otherwise a private or local registry would list
+        # releases that npm then goes looking for somewhere else.
+        project = make_node_project(tmp_path, "widget", "2.0.0")
+        commands: list[list[str]] = []
+        monkeypatch.setattr(Workspace, "_run", lambda self, cmd, *, cwd, what: commands.append(cmd))
+        with Workspace(project, "node", index_url="http://127.0.0.1:4873/") as ws:
+            assert ws.try_trial({"widget": "1.0.0"}, "true") is TrialOutcome.PASS
+        assert commands == [[*NPM_INSTALL, "--registry", "http://127.0.0.1:4873/"]]
+
+    def test_without_one_npm_keeps_its_configured_registry(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        project = make_node_project(tmp_path, "widget", "2.0.0")
+        commands: list[list[str]] = []
+        monkeypatch.setattr(Workspace, "_run", lambda self, cmd, *, cwd, what: commands.append(cmd))
+        with Workspace(project, "node") as ws:
+            assert ws.try_trial({"widget": "1.0.0"}, "true") is TrialOutcome.PASS
+        assert commands == [NPM_INSTALL]
+
+    def test_a_node_trial_installs_from_a_local_registry(self, tmp_path: Path, monkeypatch) -> None:
+        """End to end against a registry on 127.0.0.1: real npm, no network.
+
+        This is the path `--online --index-url` takes for a Node project,
+        and the one part 5 of demo.sh relies on.
+        """
+        import json
+        import shutil
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        import pytest
+
+        if shutil.which("npm") is None:
+            pytest.skip("needs npm on PATH")
+
+        tarballs = {"1.0.0": _npm_tarball("tinypad", "1.0.0", "module.exports = 'one';\n")}
+        prefix = "/tinypad/-/tinypad-"
+
+        class Registry(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # name fixed by http.server
+                if self.path == "/tinypad":
+                    body = json.dumps(_packument("tinypad", tarballs, base_url)).encode()
+                elif self.path.startswith(prefix) and self.path.endswith(".tgz"):
+                    body = tarballs.get(self.path[len(prefix) : -len(".tgz")], b"")
+                else:
+                    body = b""
+                self.send_response(200 if body else 404)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Registry)
+        base_url = f"http://127.0.0.1:{server.server_address[1]}/"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        monkeypatch.setenv("npm_config_cache", str(tmp_path / "npm-cache"))
+        monkeypatch.setenv("npm_config_update_notifier", "false")
+
+        project = make_node_project(tmp_path, "tinypad", "1.0.0")
+        (project / "check.js").write_text("process.exit(require('tinypad') === 'one' ? 0 : 1);\n")
+        before = tree_digest(project)
+        try:
+            with Workspace(project, "node", index_url=base_url, timeout=300) as ws:
+                assert ws.try_trial({"tinypad": "1.0.0"}, "node check.js") is TrialOutcome.PASS
+                # A version the registry never published will not install,
+                # which is a third answer and not a failing test.
+                outcome = ws.try_trial({"tinypad": "9.9.9"}, "node check.js")
+                assert outcome is TrialOutcome.UNINSTALLABLE
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert tree_digest(project) == before
+
+
+def _npm_tarball(name: str, version: str, index_js: str) -> bytes:
+    """A minimal npm package tarball: everything under package/, gzipped."""
+    import gzip
+    import io
+    import json
+    import tarfile
+
+    files = {
+        "package/package.json": json.dumps({"name": name, "version": version, "main": "index.js"}),
+        "package/index.js": index_js,
+    }
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        for arcname, text in files.items():
+            data = text.encode()
+            info = tarfile.TarInfo(arcname)
+            info.size = len(data)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(data))
+    return gzip.compress(raw.getvalue(), mtime=0)
+
+
+def _packument(name: str, tarballs: dict[str, bytes], base_url: str) -> dict[str, object]:
+    """The package document a registry serves for ``tarballs``."""
+    import base64
+
+    versions = {
+        version: {
+            "name": name,
+            "version": version,
+            "dist": {
+                "tarball": f"{base_url}{name}/-/{name}-{version}.tgz",
+                "shasum": hashlib.sha1(data).hexdigest(),
+                "integrity": "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode(),
+            },
+        }
+        for version, data in tarballs.items()
+    }
+    return {"name": name, "dist-tags": {"latest": max(tarballs)}, "versions": versions}

@@ -31,7 +31,8 @@ All four must pass. CI runs the same commands.
 - No new runtime dependencies without prior discussion; part of the
   point of the tool is that it installs instantly anywhere.
 - Tests for algorithms use mocked oracles, never real installs. Real
-  install tests must work offline (local wheels only).
+  install tests must work offline: local wheels for Python, a registry
+  served on 127.0.0.1 for Node.
 - Adding an ecosystem means: a parser in `manifests.py` returning
   `{name: version}`, an installer branch in `sandbox.py`, and tests
   for both, plus honest README notes on any limitation.

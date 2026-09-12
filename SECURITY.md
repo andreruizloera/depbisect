@@ -18,9 +18,11 @@ depbisect executes two categories of untrusted things on your behalf:
 The temporary-workspace design protects your project files from
 modification; it does not contain malicious code. Treat a bisect run
 with the same caution as running `pip install` or `npm install` on the
-versions involved. `--no-index --find-links` restricts installs to
-distributions you already have locally, which is the most conservative
-mode.
+versions involved. For a Python project, `--no-index --find-links`
+restricts installs to distributions you already have locally, which is
+the most conservative mode. There is no equivalent for a Node project:
+its trials always run `npm install` against a registry, npm's configured
+one or the one `--index-url` names.
 
 Manifest and lockfile parsing uses only the standard library
 (`tomllib`, `json`) and never evaluates file content as code.

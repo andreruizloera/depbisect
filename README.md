@@ -21,9 +21,11 @@ cd depbisect
 ./demo.sh
 ```
 
-The demo runs fully offline and has three parts. The first breaks a
-tiny app with a bad dependency bump and lets depbisect find the
-culprit:
+The demo runs fully offline and has five parts: local wheels, a local
+package index, a full online bisection against it, a Poetry lockfile,
+and a Node project against a local npm registry (that part needs npm on
+PATH). The first breaks a tiny app with a bad dependency bump and lets
+depbisect find the culprit:
 
 ```text
 $ cat requirements.txt
@@ -84,6 +86,7 @@ the culprit package and nothing more:
 
 ```text
 $ depbisect run --test "python test_app.py"
+workspace: /var/folders/.../depbisect-zomwk401/project (your project is not touched)
 baseline: testing bad dependency state ... FAIL
 baseline: testing good dependency state ... PASS
 
@@ -92,6 +95,7 @@ Dependency regression isolated
   Package:       jinja2
   Last passing:  3.0.3
   First failing: 3.1.4
+  Test:          python test_app.py
   Runs:          2
   Searched:      2 version(s), no intermediate candidates
 
@@ -104,6 +108,7 @@ two more test runs turn a four-release window into the exact release:
 
 ```text
 $ depbisect run --test "python test_app.py" --online
+workspace: /var/folders/.../depbisect-n_d0r3fk/project (your project is not touched)
 baseline: testing bad dependency state ... FAIL
 baseline: testing good dependency state ... PASS
 bisect:   jinja2==3.1.1 ... FAIL
@@ -114,6 +119,7 @@ Dependency regression isolated
   Package:       jinja2
   Last passing:  3.0.3
   First failing: 3.1.0
+  Test:          python test_app.py
   Runs:          4
   Searched:      6 version(s), candidates from the package index
 ```
@@ -232,6 +238,109 @@ is a gap in the evidence. That is part 3 of `./demo.sh`, which serves
 the releases from a local package index so the whole thing runs in CI
 without a network.
 
+## Node projects: bisect against the npm registry
+
+For a Node project, `--online` reads the npm registry, using the
+`package-lock.json` depbisect already diffs. Here is a real regression:
+in chalk 5.0.0, `require("chalk").red` stops being a function (measured
+on Node 24.10.0, where `typeof chalk.red` is `function` for 4.1.2 and
+`undefined` for 5.0.0). The pins go 4.1.0 to 5.3.0 and the test is:
+
+```js
+const chalk = require("chalk");
+if (typeof chalk.red !== "function") {
+  console.error("chalk.red is not a function");
+  process.exit(1);
+}
+```
+
+```text
+$ depbisect run --test "node test.js" --online
+workspace: /var/folders/.../depbisect-mbfghyoz/project (your project is not touched)
+baseline: testing bad dependency state ... FAIL
+baseline: testing good dependency state ... PASS
+subset:   reverting {ansi-styles, chalk, color-convert} ... PASS
+subset:   reverting {ansi-styles} ... FAIL
+subset:   reverting {chalk} ... PASS
+bisect:   chalk@5.0.1 ... FAIL
+bisect:   chalk@4.1.2 ... PASS
+bisect:   chalk@5.0.0 ... FAIL
+
+Dependency regression isolated
+
+  Package:       chalk
+  Last passing:  4.1.2
+  First failing: 5.0.0
+  Test:          node test.js
+  Runs:          8
+  Searched:      10 version(s), candidates from the npm registry
+```
+
+That ran against registry.npmjs.org with npm 11.6.0. Three of the eight
+runs are the subset stage: a lockfile pins every transitive package,
+and chalk 5.3.0 declares no dependencies while chalk 4.1.0 declares two
+(ansi-styles and supports-color) that pull in three more. The plan
+listed all five as removed next to chalk itself, and depbisect first
+showed that chalk alone explains the failure.
+Without `--online` the same run can only report the two pinned versions.
+
+### What the registry list is filtered by, and why
+
+The rules follow what `npm install` itself enforces, read in npm's own
+source (npm-install-checks, arborist, npm-pick-manifest) rather than
+assumed:
+
+- **Pre-releases are excluded** unless you pass `--pre`, by semver's
+  rule: any hyphen before build metadata. That differs from the Python
+  rule on purpose, because `2.0.0-post.1` is a pre-release to npm and a
+  post-release to PEP 440.
+- **Releases whose `os`, `cpu` or `libc` lists rule this host out are
+  excluded.** npm refuses to install a non-optional package like that
+  (`EBADPLATFORM`), so no trial could ever use it. The host is described
+  by asking the `node` on your PATH for `process.platform`,
+  `process.arch` and, on Linux, the C library family, which are the
+  values npm compares.
+- **Deprecated releases are kept, and named.** npm installs a deprecated
+  release asked for by its exact version, which is how trials ask, and
+  deprecation is often an end-of-life notice across a whole release
+  line: on 2026-09-12 the registry listed 38 of uuid's 55 releases as
+  deprecated, every one with the message `uuid@10 and below is no longer
+  supported`. Excluding them would delete most of a real bisection.
+- **`engines` is not a filter.** npm only warns on an `engines.node`
+  mismatch unless `engine-strict` is set, so such a release installs and
+  is tested.
+- `--include-yanked` is refused for a Node project, since npm has no
+  yanked releases.
+
+`depbisect versions` asks the registry when given `--ecosystem node`.
+Part 5 of `./demo.sh` serves one package from a local registry whose
+listing exercises each rule once, and runs real `npm install`s against
+it:
+
+```text
+$ depbisect versions padstr --from 1.0.0 --to 2.0.0 --online --ecosystem node --index-url http://127.0.0.1:64323/
+padstr: 5 candidate version(s) to bisect (source: npm registry http://127.0.0.1:64323/)
+
+  1.0.0  (good)
+  1.1.0
+  1.2.0  (deprecated)
+  1.3.0
+  2.0.0  (bad)
+
+  Deprecated releases stay candidates: npm installs a release asked for by its exact version.
+
+  Not bisected (2):
+    1.4.0-beta.1  pre-release (--pre to include)
+    1.5.0         not installable on this platform (os aix)
+    (this platform: darwin arm64)
+
+  Bisection would need at most 2 test run(s).
+```
+
+The `depbisect run` that follows tests 1.2.0 and 1.3.0 and nothing else,
+and reports 1.3.0 as the first failing release in four runs. With an
+explicit `--index-url`, trial installs come from that registry too.
+
 ## Why?
 
 `git bisect` finds the commit that broke your code, but a dependency
@@ -268,8 +377,9 @@ depbisect run --test "pytest"
 # Explicit refs:
 depbisect run --good-ref HEAD~20 --bad-ref HEAD --test "pytest"
 
-# Node projects:
+# Node projects (--online reads the npm registry):
 depbisect run --test "npm test"
+depbisect run --test "npm test" --online
 
 # See the plan without installing or running anything:
 depbisect run --test "pytest" --dry-run
@@ -279,6 +389,7 @@ depbisect run --test "pytest" --online
 
 # Just show the candidate list:
 depbisect versions requests --from 2.28.0 --to 2.31.0 --online
+depbisect versions chalk --from 4.1.0 --to 5.3.0 --online --ecosystem node
 ```
 
 Options for `depbisect run`:
@@ -291,10 +402,10 @@ Options for `depbisect run`:
 | `-C, --directory DIR` | project directory (default: `.`) |
 | `--dry-run` | print changed deps, candidates, and a run estimate; mutate nothing |
 | `--find-links DIR` | local wheel/sdist directory; install source and offline candidate list (repeatable) |
-| `--online` | query the package index for candidate releases (Python only; off by default) |
-| `--index-url URL` | simple-index base URL for `--online` and for installs (default `https://pypi.org/simple/`) |
+| `--online` | query the package index, or the npm registry for a Node project, for candidate releases (off by default) |
+| `--index-url URL` | simple-index or npm registry base URL for `--online` and for installs (default `https://pypi.org/simple/`, or `https://registry.npmjs.org/` for a Node project, whose installs then use npm's own configuration) |
 | `--pre` | include pre-releases from the index |
-| `--include-yanked` | include yanked releases from the index |
+| `--include-yanked` | include yanked releases from the index (Python only) |
 | `--no-index` | never touch the package index; install only from `--find-links` |
 | `--timeout SECONDS` | per-command timeout (default 600) |
 | `--keep-temp` | keep the temporary workspace for inspection |
@@ -303,7 +414,8 @@ Options for `depbisect run`:
 `depbisect versions PKG --from A --to B` prints the candidate path for
 one package and exits. It takes the same `--find-links`, `--online`,
 `--index-url`, `--pre`, and `--include-yanked` flags, installs
-nothing, and runs no tests.
+nothing, and runs no tests. Pass `--ecosystem node` for an npm package;
+without it, `PKG` is looked up at the Python index.
 
 Exit codes: 0 success, 2 usage or git error, 130 interrupted.
 
@@ -349,11 +461,14 @@ byte-identical after a run.
 
 depbisect makes no network request of its own unless you pass
 `--online`, and even then it only issues GET requests to the simple
-index, over http or https and no other scheme. It reads the response
-as text; nothing is executed and nothing is written to disk. Installs
-are a separate matter: `pip` and `npm` reach the network by default as
-they always have, and `--no-index --find-links DIR` is still the way
-to forbid that.
+index or the npm registry, over http or https and no other scheme. It
+reads the response as text; nothing is executed and nothing is written
+to disk. For a Node project it also runs `node -e` once, with a fixed
+script, to learn the platform npm will check. Installs are a separate
+matter: `pip` and `npm` reach the network by default as they always
+have. `--no-index --find-links DIR` is the way to forbid that for a
+Python project; a Node project has no equivalent short of an
+`--index-url` registry you run yourself.
 
 ## Architecture
 
@@ -375,10 +490,13 @@ src/depbisect/
                 that appears in real metadata), pure
   tags.py       PEP 425 compatibility tags: wheel-filename tag parsing
                 and the tag set of the running interpreter, pure
-  index.py      the only module that touches the network: simple
-                repository API client, PEP 691 JSON and PEP 503 HTML
-  candidates.py composes local and index candidates into the path a
-                bisection walks, with an account of what was filtered
+  index.py      simple repository API client, PEP 691 JSON and PEP 503
+                HTML; one of the two modules that touch the network
+  npm.py        npm registry client (abbreviated package documents),
+                npm's os/cpu/libc platform rule, and the Node host probe
+  candidates.py composes local, index and registry candidates into the
+                path a bisection walks, with an account of what was
+                filtered
   sandbox.py    the safety layer: temp-copy workspace, fresh venvs,
                 trial installs, test execution
 ```
@@ -389,15 +507,29 @@ never install anything.
 
 A session is: two baseline runs (bad state must fail, good state must
 pass), then subset minimization, then version bisection of the single
-culprit over whatever candidate list is derivable offline.
+culprit over the candidates found in local wheels and, with `--online`,
+at the index or registry.
 
 ## Limitations
 
-- **Index candidate discovery is Python only.** `--online` speaks the
-  simple repository API; there is no npm registry client, so Node
-  candidate versions still come from `--find-links` alone. Without
-  either source depbisect bisects between the two known versions only,
-  and the report says so.
+- **`--find-links` supplies no Node candidates.** An `npm pack` tarball
+  (`name-version.tgz`) is not read as a distribution filename, and Node
+  trials never point npm at the directory, so for a Node project the
+  only source of intermediate releases is `--online`. Without it
+  depbisect bisects between the two known versions only, and the report
+  says so.
+- **Without `--index-url`, a Node project's candidates and installs can
+  come from different registries.** Candidates are read from
+  registry.npmjs.org, while `npm install` uses whatever registry npm is
+  configured with (`.npmrc`). A candidate the configured registry does
+  not have fails to install and reads as a skip.
+- **`depbisect versions` cannot tell which ecosystem a name belongs to.**
+  Without `--ecosystem node` it asks the Python index, where an
+  unrelated project with the same name can answer.
+- **In a Node lockfile every transitive package is a pin.** A bump that
+  changes a package's own dependencies shows up as several changed
+  entries, and the subset stage spends runs ruling them out before the
+  version bisection starts.
 - **A skipped release still leaves a real gap.** Wheel tags take the
   releases that could never have installed here out of the search
   before it starts, but they cannot speak for a source distribution: an
@@ -435,8 +567,9 @@ culprit over whatever candidate list is derivable offline.
   source tree, and a project relying on Poetry or Pipenv install
   semantics beyond the pinned versions (extras resolution, group
   selection) gets the pins and not those semantics.
-- Node trials run `npm install` in the copy, which needs registry
-  access (or a warm npm cache); the offline guarantee is Python-only.
+- Node trials run `npm install` in the copy, which needs a registry:
+  the public one, npm's configured one, or one you serve yourself and
+  name with `--index-url`, as part 5 of the demo does.
 - Assumes a single pass/fail boundary; flaky tests will mislead any
   bisection, this one included.
 

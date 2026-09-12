@@ -1,7 +1,8 @@
 """Read a package index for the releases between two versions (opt-in).
 
-This is the only part of depbisect that touches the network, and it is
-off unless you pass ``--online``. It speaks the simple repository API,
+This module and npm.py are the only parts of depbisect that touch the
+network, and both are off unless you pass ``--online``. This one speaks
+the simple repository API,
 so it works against PyPI and against any index that implements PEP 503
 or PEP 691 (devpi, Artifactory, a private mirror).
 
@@ -129,7 +130,7 @@ def fetch_releases(
     the default is ``urllib.request.urlopen``.
     """
     url = release_url(index_url, package)
-    body, content_type = _get(url, timeout=timeout, opener=opener)
+    body, content_type = http_get(url, timeout=timeout, opener=opener)
     return parse_index(body, package, content_type=content_type)
 
 
@@ -144,12 +145,24 @@ def release_url(index_url: str, package: str) -> str:
     return f"{index_url.rstrip('/')}/{normalize_name(package)}/"
 
 
-def _get(url: str, *, timeout: float, opener: object) -> tuple[bytes, str]:
+def http_get(
+    url: str,
+    *,
+    timeout: float,
+    opener: object,
+    accept: str = _ACCEPT,
+    missing: str = "no such project at this index",
+) -> tuple[bytes, str]:
+    """GET one URL and return its body and content type.
+
+    Shared with npm.py, which passes its own ``accept`` header and its
+    own wording for a 404. Callers check the scheme before building the
+    URL, so this cannot open a file:// URL.
+    """
     call = opener if opener is not None else urlopen
-    # The scheme is checked in release_url, so this cannot open a file:// URL.
     request = Request(
         url,
-        headers={"Accept": _ACCEPT, "User-Agent": f"depbisect/{__version__}"},
+        headers={"Accept": accept, "User-Agent": f"depbisect/{__version__}"},
     )
     try:
         with call(request, timeout=timeout) as response:  # type: ignore[operator]
@@ -157,7 +170,7 @@ def _get(url: str, *, timeout: float, opener: object) -> tuple[bytes, str]:
             content_type = response.headers.get("Content-Type", "") or ""
     except HTTPError as exc:
         if exc.code == 404:
-            raise IndexError_(f"{url} returned 404: no such project at this index") from exc
+            raise IndexError_(f"{url} returned 404: {missing}") from exc
         raise IndexError_(f"{url} returned HTTP {exc.code}") from exc
     except URLError as exc:
         raise IndexError_(f"could not reach {url}: {exc.reason}") from exc

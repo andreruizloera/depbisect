@@ -149,8 +149,12 @@ class Workspace:
 
     def _install(self, pins: dict[str, str]) -> Path | None:
         if self.ecosystem == "node":
+            # An explicit --index-url is the registry the candidates were
+            # read from, so the installs come from it too. Without one,
+            # npm uses whatever registry it is configured with.
+            registry = ["--registry", self.index_url] if self.index_url else []
             self._run(
-                ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error"],
+                ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error", *registry],
                 cwd=self.copy_dir,
                 what="npm install",
             )

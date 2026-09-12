@@ -10,8 +10,17 @@ from pathlib import Path
 
 import pytest
 
-from depbisect.candidates import PLATFORM, PYTHON, build_candidates, filter_releases
+from depbisect.candidates import (
+    PLATFORM,
+    PRE,
+    PYTHON,
+    build_candidates,
+    default_index_url,
+    filter_npm_releases,
+    filter_releases,
+)
 from depbisect.index import DistFile, IndexError_, Release
+from depbisect.npm import NpmHost, NpmRelease
 from depbisect.tags import Tag
 
 #: Stands in for a host that can install pure-Python wheels and nothing else.
@@ -398,3 +407,128 @@ class TestRunEstimate:
         )
         assert result.interior == interior
         assert result.max_runs() == expected
+
+
+MAC = NpmHost("darwin", "arm64")
+
+
+def npm_fetcher(releases: list[NpmRelease]):
+    def fetch(package: str, **kwargs: object) -> list[NpmRelease]:
+        return releases
+
+    return fetch
+
+
+class TestNpmCandidates:
+    """The same path assembly, fed by the npm registry for a Node project."""
+
+    def test_registry_releases_become_candidates(self) -> None:
+        def no_python_index(package: str, **kwargs: object) -> list[Release]:
+            raise AssertionError("a Node package must not be looked up at the Python index")
+
+        result = build_candidates(
+            "widget",
+            "1.0.0",
+            "2.0.0",
+            ecosystem="node",
+            online=True,
+            fetch=no_python_index,
+            fetch_npm=npm_fetcher([NpmRelease("1.1.0"), NpmRelease("1.2.0"), NpmRelease("3.0.0")]),
+        )
+        assert result.path == ["1.0.0", "1.1.0", "1.2.0", "2.0.0"]
+        assert result.source == "index"
+        assert result.ecosystem == "node"
+
+    def test_the_default_url_follows_the_ecosystem(self) -> None:
+        seen: dict[str, object] = {}
+
+        def fetch(package: str, **kwargs: object) -> list[NpmRelease]:
+            seen.update(kwargs)
+            return []
+
+        build_candidates("widget", "1.0.0", "2.0.0", ecosystem="node", online=True, fetch_npm=fetch)
+        assert seen["registry_url"] == "https://registry.npmjs.org/"
+        assert default_index_url("python") == "https://pypi.org/simple/"
+
+    def test_a_semver_hyphen_is_a_prerelease_whatever_follows_it(self) -> None:
+        kept, excluded = filter_npm_releases(
+            [NpmRelease("2.0.0-post.1"), NpmRelease("2.0.0-rc.1"), NpmRelease("2.0.1+build.5")]
+        )
+        assert kept == ["2.0.1+build.5"]
+        assert reasons(excluded) == [("2.0.0-post.1", PRE), ("2.0.0-rc.1", PRE)]
+        # PEP 440 reads the same string as a post-release and keeps it, which
+        # is why the two ecosystems cannot share one pre-release rule.
+        assert filter_releases([release("2.0.0-post.1")])[0] == ["2.0.0-post.1"]
+
+    def test_pre_flag_keeps_them(self) -> None:
+        kept, excluded = filter_npm_releases([NpmRelease("2.0.0-rc.1")], allow_pre=True)
+        assert kept == ["2.0.0-rc.1"]
+        assert excluded == ()
+
+    def test_deprecated_releases_stay_candidates_and_are_named(self) -> None:
+        # Deprecation is often an end-of-life notice on releases that still
+        # install. Dropping them would delete candidates.
+        result = build_candidates(
+            "widget",
+            "1.0.0",
+            "2.0.0",
+            ecosystem="node",
+            online=True,
+            fetch_npm=npm_fetcher(
+                [NpmRelease("1.1.0", deprecated="no longer supported"), NpmRelease("1.2.0")]
+            ),
+        )
+        assert result.path == ["1.0.0", "1.1.0", "1.2.0", "2.0.0"]
+        assert result.deprecated == ("1.1.0",)
+        assert result.excluded == 0
+
+    def test_a_release_npm_refuses_on_this_platform_is_excluded(self) -> None:
+        kept, excluded = filter_npm_releases(
+            [NpmRelease("1.1.0", os=("win32",), cpu=("x64",)), NpmRelease("1.2.0", os=("darwin",))],
+            host=MAC,
+        )
+        assert kept == ["1.2.0"]
+        assert reasons(excluded) == [("1.1.0", PLATFORM)]
+        assert excluded[0].detail == "not installable on this platform (os win32; cpu x64)"
+
+    def test_no_host_means_no_platform_filtering(self) -> None:
+        # host=None is what a machine without a readable Node produces.
+        kept, excluded = filter_npm_releases([NpmRelease("1.1.0", os=("win32",))], host=None)
+        assert kept == ["1.1.0"]
+        assert excluded == ()
+
+    def test_exclusions_count_the_interval_only(self) -> None:
+        result = build_candidates(
+            "widget",
+            "1.0.0",
+            "2.0.0",
+            ecosystem="node",
+            online=True,
+            npm_host=MAC,
+            fetch_npm=npm_fetcher(
+                [
+                    NpmRelease("0.9.0", os=("win32",)),  # older than good
+                    NpmRelease("1.5.0", os=("win32",)),
+                    NpmRelease("1.6.0-beta.1"),
+                    NpmRelease("3.0.0-rc.1"),  # newer than bad
+                ]
+            ),
+        )
+        assert result.path == ["1.0.0", "2.0.0"]
+        assert result.excluded_platform == 1
+        assert result.excluded_pre == 1
+        assert result.describe_exclusions(platform="darwin arm64") == (
+            "Excluded from the registry list: 1 pre-release(s), "
+            "1 not installable on this platform (darwin arm64)"
+        )
+
+    def test_a_registry_failure_degrades_to_a_note(self) -> None:
+        def fetch(package: str, **kwargs: object) -> list[NpmRelease]:
+            raise IndexError_("could not reach the registry")
+
+        result = build_candidates(
+            "widget", "1.0.0", "2.0.0", ecosystem="node", online=True, fetch_npm=fetch
+        )
+        assert result.note == "could not reach the registry"
+        assert result.path == ["1.0.0", "2.0.0"]
+        assert result.source == "none"

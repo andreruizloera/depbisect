@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end demo of depbisect against a deliberately broken dependency
-# bump. Runs fully offline, in four parts:
+# bump. Runs fully offline, in five parts:
 #
 #   1. Local wheels only: the "package index" is a directory of wheels
 #      committed under examples/demo/wheels.
@@ -16,12 +16,17 @@
 #      so it is probed, and skipped and named when it does not.
 #   4. The same regression in a Poetry project, to show that the
 #      manifest a project happens to use does not change the answer.
+#   5. A Node project bisected against an npm registry, served on
+#      127.0.0.1 by examples/demo/serve_registry.py, with real npm
+#      installs. The registry lists a deprecated release, which stays a
+#      candidate, and a pre-release and an AIX-only release, which do
+#      not. Needs npm on PATH.
 #
-# The scenario: a demo app pins brokenlib==1.0.0 and okpkg==1.0.0 (the
-# committed, known-good state). Someone bumps both pins in the working
-# tree (brokenlib -> 2.0.0, okpkg -> 1.1.0) and the tests start
-# failing. depbisect figures out which package broke it, and at which
-# release.
+# The scenario for parts 1 to 4: a demo app pins brokenlib==1.0.0 and
+# okpkg==1.0.0 (the committed, known-good state). Someone bumps both pins
+# in the working tree (brokenlib -> 2.0.0, okpkg -> 1.1.0) and the tests
+# start failing. depbisect figures out which package broke it, and at
+# which release. Part 5 is the same shape with padstr 1.0.0 -> 2.0.0.
 #
 # Every line this script greps for is a line the README pastes. If the
 # tool's output drifts from the docs, this exits nonzero and CI fails.
@@ -31,13 +36,14 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 WHEELS="$ROOT/examples/demo/wheels"
 WORK="$(mktemp -d)"
 PORT_FILE="$WORK/index-port"
-SERVER_PID=""
+REGISTRY_PORT_FILE="$WORK/registry-port"
+SERVER_PIDS=()
 
 cleanup() {
-    if [ -n "$SERVER_PID" ]; then
-        kill "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-    fi
+    for pid in "${SERVER_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -62,6 +68,18 @@ require() {
             exit 1
         fi
     done
+}
+
+start_server() {
+    # start_server <script> <portfile>: run a local server, wait for its port.
+    "${PYTHON[@]}" "$1" "$2" &
+    SERVER_PIDS+=("$!")
+    for _ in $(seq 1 80); do
+        [ -s "$2" ] && return 0
+        sleep 0.25
+    done
+    echo "demo: $(basename "$1") failed to start" >&2
+    exit 1
 }
 
 # Set up the demo project as a git repo with a known-good committed state.
@@ -95,16 +113,7 @@ require "$WORK/part1.txt" \
     "candidates from local wheels"
 
 # Start the local package index for parts 2 and 3.
-"${PYTHON[@]}" "$ROOT/examples/demo/serve_index.py" "$PORT_FILE" &
-SERVER_PID=$!
-for _ in $(seq 1 80); do
-    [ -s "$PORT_FILE" ] && break
-    sleep 0.25
-done
-if [ ! -s "$PORT_FILE" ]; then
-    echo "demo: local package index failed to start" >&2
-    exit 1
-fi
+start_server "$ROOT/examples/demo/serve_index.py" "$PORT_FILE"
 INDEX_URL="http://127.0.0.1:$(cat "$PORT_FILE")/simple/"
 
 echo
@@ -224,4 +233,80 @@ require "$WORK/part4.txt" \
     "candidates from local wheels"
 
 echo
-echo "demo: all four parts matched the output the README documents."
+echo "=============================================================="
+echo "Part 5: a Node project, candidates from an npm registry"
+echo "=============================================================="
+if ! command -v npm >/dev/null 2>&1; then
+    echo "demo: part 5 needs npm on PATH" >&2
+    exit 1
+fi
+# Trials run real npm installs. Their cache and npm's update check are
+# pointed away from the user's own, so the demo leaves nothing behind.
+export npm_config_cache="$WORK/npm-cache"
+export npm_config_update_notifier=false
+
+start_server "$ROOT/examples/demo/serve_registry.py" "$REGISTRY_PORT_FILE"
+REGISTRY_URL="http://127.0.0.1:$(cat "$REGISTRY_PORT_FILE")/"
+
+NODE_PROJECT="$WORK/node-project"
+mkdir -p "$NODE_PROJECT"
+cp "$ROOT/examples/demo/node/package.json" "$ROOT/examples/demo/node/package-lock.json" \
+    "$ROOT/examples/demo/node/test.js" "$NODE_PROJECT"
+cd "$NODE_PROJECT"
+git init -q
+git -c user.name=demo -c user.email=demo@example.invalid add .
+git -c user.name=demo -c user.email=demo@example.invalid commit -qm "pin padstr 1.0.0"
+cp "$ROOT/examples/demo/node/bad/package.json" "$ROOT/examples/demo/node/bad/package-lock.json" \
+    "$NODE_PROJECT"
+
+echo "$ depbisect versions padstr --from 1.0.0 --to 2.0.0 --online --ecosystem node --index-url $REGISTRY_URL"
+"${DEPBISECT[@]}" versions padstr \
+    --from 1.0.0 --to 2.0.0 \
+    --online --ecosystem node --index-url "$REGISTRY_URL" | tee "$WORK/part5-versions.txt"
+require "$WORK/part5-versions.txt" \
+    "padstr: 5 candidate version(s) to bisect (source: npm registry http://127.0.0.1:" \
+    "1.0.0  (good)" \
+    "1.1.0" \
+    "1.2.0  (deprecated)" \
+    "1.3.0" \
+    "2.0.0  (bad)" \
+    "Deprecated releases stay candidates: npm installs a release asked for by its exact version." \
+    "Not bisected (2):" \
+    "1.4.0-beta.1  pre-release (--pre to include)" \
+    "1.5.0         not installable on this platform (os aix)" \
+    "(this platform: " \
+    "Bisection would need at most 2 test run(s)."
+
+# Neither left-out release may be on the path itself.
+if grep -qE "^  1\.(4\.0-beta\.1|5\.0)$" "$WORK/part5-versions.txt"; then
+    echo "DEMO CHECK FAILED: a release the registry listing ruled out is still a candidate" >&2
+    exit 1
+fi
+
+echo
+echo "$ depbisect run --test \"node test.js\" --online --index-url $REGISTRY_URL"
+"${DEPBISECT[@]}" run \
+    --test "node test.js" \
+    --online --index-url "$REGISTRY_URL" | tee "$WORK/part5.txt"
+require "$WORK/part5.txt" \
+    "baseline: testing bad dependency state ... FAIL" \
+    "baseline: testing good dependency state ... PASS" \
+    "bisect:   padstr@1.2.0 ... PASS" \
+    "bisect:   padstr@1.3.0 ... FAIL" \
+    "Dependency regression isolated" \
+    "Package:       padstr" \
+    "Last passing:  1.2.0" \
+    "First failing: 1.3.0" \
+    "Test:          node test.js" \
+    "Runs:          4" \
+    "Searched:      5 version(s), candidates from the npm registry" \
+    "note: excluded from the registry list: 1 pre-release(s), 1 not installable on this platform ("
+
+# No test run may be spent on a release the registry listing ruled out.
+if grep -qE "bisect:   padstr@1\.(4\.0-beta\.1|5\.0) " "$WORK/part5.txt"; then
+    echo "DEMO CHECK FAILED: a test run was spent on an excluded release" >&2
+    exit 1
+fi
+
+echo
+echo "demo: all five parts matched the output the README documents."

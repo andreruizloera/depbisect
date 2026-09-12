@@ -10,11 +10,31 @@ pre-release status, yanked status, `Requires-Python`, and PEP 425 wheel
 tags against the interpreter the trials run under. A release whose
 every distribution is a wheel for another platform is excluded before
 the search starts; an sdist-only release is never excluded, because it
-may build. Still open:
+may build.
 
-- An npm registry client, so `--online` works for Node projects too.
-  The candidate path and the search are already ecosystem-agnostic;
-  only the client is missing.
+Shipped: `--online` for Node projects reads the npm registry's
+abbreviated package document, filtered by semver pre-release status and
+by the `os`, `cpu` and `libc` lists npm enforces, with deprecated
+releases kept and named. Still open:
+
+- `--find-links` for Node. It supplies no Node candidates today: an
+  `npm pack` tarball (`name-version.tgz`) is not recognised as a
+  distribution filename, and Node trials never point npm at the
+  directory. Both halves are needed for an offline Node bisection.
+- Read the registry npm is configured with (`.npmrc`,
+  `npm_config_registry`) when `--index-url` is not given, instead of
+  defaulting to registry.npmjs.org while the trial installs use npm's
+  own configuration.
+- An opt-in `engines` filter for projects that set `engine-strict`,
+  where npm refuses a release whose `engines.node` this Node does not
+  satisfy instead of warning.
+- Let `depbisect versions` infer `--ecosystem` from a manifest in the
+  current directory. Without the flag an npm name is looked up at PyPI,
+  where an unrelated project of the same name can answer.
+- Order semver pre-releases by semver's precedence. Under `--pre` they
+  are ordered by the shared PEP 440-flavoured comparator, which reads a
+  tag like `2.0.0-post.1` as newer than 2.0.0 and so places it outside
+  a 1.0.0 to 2.0.0 interval that semver puts it inside.
 - Read candidate versions out of the pip and uv wheel caches, which are
   often already warm on developer machines and keep the offline
   guarantee.

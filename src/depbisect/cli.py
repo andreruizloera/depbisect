@@ -6,13 +6,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from depbisect import __version__
+from depbisect import __version__, npm
 from depbisect.bisector import (
     bisect_versions,
     estimate_runs,
     minimize_breaking_set,
 )
-from depbisect.candidates import CandidateSet, build_candidates
+from depbisect.candidates import CandidateSet, build_candidates, default_index_url
 from depbisect.diffing import ChangedDep, diff_states
 from depbisect.errors import DepbisectError
 from depbisect.gitref import (
@@ -105,6 +105,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     versions.add_argument("--to", dest="bad", required=True, metavar="VERSION", help="known-bad")
     versions.add_argument(
+        "--ecosystem",
+        choices=("python", "node"),
+        default="python",
+        help="which registry PACKAGE lives in: the Python package index or the npm "
+        "registry (default: python). A run reads this from the project's manifest",
+    )
+    versions.add_argument(
         "--find-links",
         action="append",
         default=[],
@@ -127,14 +134,15 @@ def _add_index_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--online",
         action="store_true",
-        help="query the package index for the releases between the good and bad "
-        "versions (Python only). Off by default: without it depbisect makes no "
-        "network request of its own",
+        help="query the package index, or the npm registry for a Node project, for the "
+        "releases between the good and bad versions. Off by default: without it "
+        "depbisect makes no network request of its own",
     )
     parser.add_argument(
         "--index-url",
         metavar="URL",
-        help=f"simple-index base URL for --online and for installs (default: {DEFAULT_INDEX_URL})",
+        help="package index (simple API) or npm registry base URL, for --online and for "
+        f"installs (default: {DEFAULT_INDEX_URL}, or {npm.DEFAULT_REGISTRY_URL} for Node)",
     )
     parser.add_argument(
         "--pre",
@@ -144,7 +152,7 @@ def _add_index_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--include-yanked",
         action="store_true",
-        help="include yanked releases from the index",
+        help="include yanked releases from the index (Python only; npm has no yanked releases)",
     )
 
 
@@ -182,10 +190,11 @@ def _check_index_options(args: argparse.Namespace, ecosystem: str | None = None)
             )
         if args.index_url:
             raise DepbisectError("--index-url has no meaning with --no-index")
-    if args.online and ecosystem == "node":
+    if args.include_yanked and ecosystem == "node":
         raise DepbisectError(
-            "--online reads a Python simple index; there is no npm registry support yet, "
-            "so Node candidate versions still come from --find-links only"
+            "--include-yanked has no meaning for an npm package: the registry has no yanked "
+            "releases, and deprecated ones are already kept as candidates because npm "
+            "installs them"
         )
     if (args.pre or args.include_yanked) and not args.online:
         raise DepbisectError(
@@ -194,18 +203,37 @@ def _check_index_options(args: argparse.Namespace, ecosystem: str | None = None)
         )
 
 
+def _npm_host(args: argparse.Namespace, ecosystem: str) -> npm.NpmHost | None:
+    """Ask Node how npm will describe this host, only when it matters."""
+    if args.online and ecosystem == "node":
+        return npm.host_platform()
+    return None
+
+
+def _platform_label(ecosystem: str, host: npm.NpmHost | None) -> str | None:
+    """The platform a platform exclusion was judged against, for a message."""
+    if ecosystem == "node":
+        return host.describe() if host is not None else None
+    return TRIAL_PLATFORM
+
+
 def show_versions(args: argparse.Namespace) -> int:
     """``depbisect versions``: print the path a bisection would walk."""
-    _check_index_options(args)
+    ecosystem = args.ecosystem
+    _check_index_options(args, ecosystem)
+    index_url = args.index_url or default_index_url(ecosystem)
+    host = _npm_host(args, ecosystem)
     candidates = build_candidates(
         args.package,
         args.good,
         args.bad,
+        ecosystem=ecosystem,
         find_links=[Path(d) for d in args.find_links],
         online=args.online,
-        index_url=args.index_url or DEFAULT_INDEX_URL,
+        index_url=index_url,
         python=TRIAL_PYTHON,
         tags=TRIAL_TAGS,
+        npm_host=host,
         allow_pre=args.pre,
         allow_yanked=args.include_yanked,
         timeout=args.timeout,
@@ -213,7 +241,7 @@ def show_versions(args: argparse.Namespace) -> int:
     if candidates.note is not None:
         raise DepbisectError(f"index query failed: {candidates.note}")
 
-    where = _source_phrase(candidates, args.index_url or DEFAULT_INDEX_URL)
+    where = _source_phrase(candidates, index_url)
     print(f"{args.package}: {len(candidates.path)} candidate version(s) to bisect ({where})\n")
     for version in candidates.path:
         label = ""
@@ -221,8 +249,15 @@ def show_versions(args: argparse.Namespace) -> int:
             label = "  (good)"
         elif version == candidates.path[-1]:
             label = "  (bad)"
+        elif version in candidates.deprecated:
+            label = "  (deprecated)"
         print(f"  {version}{label}")
     print()
+    if candidates.deprecated:
+        print(
+            "  Deprecated releases stay candidates: npm installs a release asked for by "
+            "its exact version.\n"
+        )
     # This subcommand exists to show the candidate path AND what was left
     # out of it, so every excluded release is named with its reason,
     # rather than summed into a count as the run report does.
@@ -231,8 +266,11 @@ def show_versions(args: argparse.Namespace) -> int:
         print(f"  Not bisected ({candidates.excluded}):")
         for item in candidates.excluded_versions:
             print(f"    {item.version:<{width}}  {item.detail}")
-        if candidates.excluded_platform and TRIAL_PLATFORM:
-            print(f"    (this platform: {TRIAL_PLATFORM}, Python {_python_text()})")
+        platform = _platform_label(ecosystem, host)
+        if candidates.excluded_platform and platform:
+            if ecosystem == "python":
+                platform = f"{platform}, Python {_python_text()}"
+            print(f"    (this platform: {platform})")
         print()
     print(f"  Bisection would need at most {candidates.max_runs()} test run(s).")
     return 0
@@ -243,10 +281,11 @@ def _python_text() -> str:
 
 
 def _source_phrase(candidates: CandidateSet, index_url: str) -> str:
+    place = f"npm registry {index_url}" if candidates.ecosystem == "node" else f"index {index_url}"
     if candidates.source == "index":
-        return f"source: index {index_url}"
+        return f"source: {place}"
     if candidates.source == "index and local":
-        return f"source: index {index_url} and local wheels"
+        return f"source: {place} and local wheels"
     if candidates.source == "local":
         return "source: local wheels"
     return "no intermediate releases found"
@@ -288,13 +327,17 @@ def run_session(args: argparse.Namespace) -> int:
         )
 
     find_links = [Path(d) for d in args.find_links]
-    candidates = _candidate_paths(changed, find_links, ecosystem, args)
+    host = _npm_host(args, ecosystem)
+    candidates = _candidate_paths(changed, find_links, ecosystem, host, args)
+    platform = _platform_label(ecosystem, host)
 
     if args.dry_run:
-        _print_plan(project, ecosystem, source, good_ref, bad_ref, args.test, changed, candidates)
+        _print_plan(
+            project, ecosystem, source, good_ref, bad_ref, args.test, changed, candidates, platform
+        )
         return 0
 
-    return _bisect(project, ecosystem, good_state, bad_state, changed, candidates, args)
+    return _bisect(project, ecosystem, good_state, bad_state, changed, candidates, platform, args)
 
 
 def _read_state(project: Path, ref: str, source: str, ecosystem: str) -> DepState:
@@ -306,14 +349,15 @@ def _candidate_paths(
     changed: list[ChangedDep],
     find_links: list[Path],
     ecosystem: str,
+    host: npm.NpmHost | None,
     args: argparse.Namespace,
 ) -> dict[str, CandidateSet]:
     """Candidate version path per version-changed dependency.
 
     Candidates come from local dist directories (--find-links) and, with
-    --online, from the package index. When neither yields anything the
-    path is just [good, bad]: depbisect then bisects between the two
-    known versions only, and says so in the report.
+    --online, from the package index or the npm registry. When neither
+    yields anything the path is just [good, bad]: depbisect then bisects
+    between the two known versions only, and says so in the report.
     """
     paths: dict[str, CandidateSet] = {}
     for dep in changed:
@@ -324,11 +368,13 @@ def _candidate_paths(
             dep.name,
             dep.good,
             dep.bad,
+            ecosystem=ecosystem,
             find_links=find_links,
-            online=args.online and ecosystem == "python",
-            index_url=args.index_url or DEFAULT_INDEX_URL,
+            online=args.online,
+            index_url=args.index_url or default_index_url(ecosystem),
             python=TRIAL_PYTHON,
             tags=TRIAL_TAGS,
+            npm_host=host,
             allow_pre=args.pre,
             allow_yanked=args.include_yanked,
         )
@@ -353,6 +399,7 @@ def _print_plan(
     test_cmd: str,
     changed: list[ChangedDep],
     candidates: dict[str, CandidateSet],
+    platform: str | None,
 ) -> None:
     print("depbisect plan (dry run)\n")
     print(f"  Project:   {project} ({ecosystem})")
@@ -363,14 +410,15 @@ def _print_plan(
     print(f"  Changed dependencies ({len(changed)}):")
     width = max(len(dep.name) for dep in changed)
     max_candidates = 2
+    index = "the registry" if ecosystem == "node" else "the index"
     for dep in changed:
         line = f"    {dep.name:<{width}}  {dep.describe()}"
         found = candidates.get(dep.name)
         if found is not None:
             if found.interior > 0:
                 where = {
-                    "index": "from the index",
-                    "index and local": "from the index and local wheels",
+                    "index": f"from {index}",
+                    "index and local": f"from {index} and local wheels",
                     "local": "found locally",
                 }[found.source]
                 line += f"   ({found.interior} intermediate release(s) {where})"
@@ -378,7 +426,7 @@ def _print_plan(
             else:
                 line += "   (no intermediate versions found)"
         print(line)
-        exclusions = found.describe_exclusions(platform=TRIAL_PLATFORM) if found else None
+        exclusions = found.describe_exclusions(platform=platform) if found else None
         if exclusions:
             print(f"    {'':<{width}}  {exclusions.lower()}")
     lo, hi = estimate_runs(len(changed), max_candidates)
@@ -393,6 +441,7 @@ def _bisect(
     bad_state: DepState,
     changed: list[ChangedDep],
     candidates: dict[str, CandidateSet],
+    platform: str | None,
     args: argparse.Namespace,
 ) -> int:
     total_runs = 0
@@ -463,9 +512,10 @@ def _bisect(
 
         # Stage 2: bisect the culprit's candidate versions.
         candidate_set = candidates[culprit.name]
+        pin = "@" if ecosystem == "node" else "=="
 
         def version_oracle(version: str) -> bool | None:
-            print(f"bisect:   {culprit.name}=={version} ... ", end="", flush=True)
+            print(f"bisect:   {culprit.name}{pin}{version} ... ", end="", flush=True)
             pins = pins_with_reverted(all_names - {culprit.name})
             pins[culprit.name] = version
             outcome = ws.try_trial(pins, args.test)
@@ -487,6 +537,7 @@ def _bisect(
             total_runs,
             candidate_set,
             result.skipped,
+            platform,
         )
         if args.keep_temp:
             print(f"\nworkspace kept at {ws.copy_dir}")
@@ -501,6 +552,7 @@ def _report_success(
     runs: int,
     candidates: CandidateSet,
     skipped: list[str],
+    platform: str | None = None,
 ) -> None:
     print("\nDependency regression isolated\n")
     print(f"  Package:       {package}")
@@ -508,9 +560,10 @@ def _report_success(
     print(f"  First failing: {first_failing}")
     print(f"  Test:          {test_cmd}")
     print(f"  Runs:          {runs}")
+    index = "the npm registry" if candidates.ecosystem == "node" else "the package index"
     sources = {
-        "index": "candidates from the package index",
-        "index and local": "candidates from the package index and local wheels",
+        "index": f"candidates from {index}",
+        "index and local": f"candidates from {index} and local wheels",
         "local": "candidates from local wheels",
         "none": "no intermediate candidates",
     }
@@ -527,7 +580,7 @@ def _report_success(
             f"{first_failing} were not tested."
         )
         if candidates.source == "none" and not candidates.note:
-            print("        --online would look them up at the package index.")
+            print(f"        --online would look them up at {index}.")
     if skipped:
         one = len(skipped) == 1
         print(
@@ -536,7 +589,7 @@ def _report_success(
             f"{'was' if one else 'were'} skipped rather than blamed: " + ", ".join(skipped)
         )
         print("        the boundary above is therefore not tight.")
-    exclusions = candidates.describe_exclusions(platform=TRIAL_PLATFORM)
+    exclusions = candidates.describe_exclusions(platform=platform)
     if exclusions:
         print(f"\n  note: {exclusions.lower()}")
 

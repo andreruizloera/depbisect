@@ -421,13 +421,143 @@ class TestIndexFlagValidation:
         assert code == 2
         assert "need --online" in capsys.readouterr().err
 
-    def test_online_rejected_for_node_projects(self, tmp_path: Path, capsys) -> None:
+    def test_include_yanked_rejected_for_node_projects(self, tmp_path: Path, capsys) -> None:
+        # npm has no yanked releases. Deprecated ones are the nearest thing
+        # and they are kept, so the flag could only ever be ignored silently.
         node = tmp_path / "node"
         node.mkdir()
         (node / "package.json").write_text('{"dependencies": {"left-pad": "1.0.0"}}')
-        code = main(["run", "--test", "npm test", "-C", str(node), "--dry-run", "--online"])
+        code = main(
+            [
+                "run",
+                "--test",
+                "npm test",
+                "-C",
+                str(node),
+                "--dry-run",
+                "--online",
+                "--include-yanked",
+            ]
+        )
         assert code == 2
-        assert "no npm registry support yet" in capsys.readouterr().err
+        assert "--include-yanked has no meaning for an npm package" in capsys.readouterr().err
+
+
+def write_node_pins(project: Path, version: str) -> None:
+    (project / "package.json").write_text(
+        f'{{"name": "app", "version": "1.0.0", "dependencies": {{"widget": "{version}"}}}}\n'
+    )
+    (project / "package-lock.json").write_text(
+        '{"lockfileVersion": 3, "packages": {"": {}, '
+        f'"node_modules/widget": {{"version": "{version}"}}}}}}\n'
+    )
+
+
+@pytest.fixture
+def node_project(tmp_path: Path) -> Path:
+    """A Node repo whose worktree bumps widget 1.0.0 -> 2.0.0 in package-lock.json."""
+    proj = tmp_path / "node-proj"
+    proj.mkdir()
+    git(proj, "init", "-q")
+    write_node_pins(proj, "1.0.0")
+    git(proj, "add", ".")
+    git(proj, "commit", "-qm", "good pins")
+    write_node_pins(proj, "2.0.0")
+    return proj
+
+
+MAC = candidates.NpmHost("darwin", "arm64")
+
+#: widget's registry listing between 1.0.0 and 2.0.0: two releases a trial
+#: can use, one of them deprecated, one npm refuses on MAC, one pre-release.
+WIDGET_RELEASES = [
+    candidates.NpmRelease("1.1.0"),
+    candidates.NpmRelease("1.2.0", deprecated="use 2.x"),
+    candidates.NpmRelease("1.5.0", os=("win32",)),
+    candidates.NpmRelease("2.0.0-rc.1"),
+]
+
+
+def stub_registry(monkeypatch, releases: list[candidates.NpmRelease] | Exception) -> None:
+    """Replace the npm client and the Node host probe: no socket, no node."""
+
+    def fetch(package: str, **kwargs: object) -> list[candidates.NpmRelease]:
+        if isinstance(releases, Exception):
+            raise releases
+        return releases
+
+    monkeypatch.setattr(candidates, "fetch_npm_releases", fetch)
+    monkeypatch.setattr("depbisect.npm.host_platform", lambda: MAC)
+
+
+class TestNodeOnline:
+    def test_registry_candidates_tighten_a_node_boundary(
+        self, node_project: Path, capsys, monkeypatch
+    ) -> None:
+        stub_registry(monkeypatch, WIDGET_RELEASES)
+        monkeypatch.setattr(Workspace, "try_trial", fake_trials({"widget": "1.2.0"}))
+        code = main(["run", "--test", "npm test", "-C", str(node_project), "--online"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "bisect:   widget@1.1.0 ... PASS" in out
+        assert "bisect:   widget@1.2.0 ... FAIL" in out
+        assert "Last passing:  1.1.0" in out
+        assert "First failing: 1.2.0" in out
+        assert "Searched:      4 version(s), candidates from the npm registry" in out
+        assert (
+            "note: excluded from the registry list: 1 pre-release(s), "
+            "1 not installable on this platform (darwin arm64)"
+        ) in out
+
+    def test_the_node_plan_counts_registry_candidates(
+        self, node_project: Path, capsys, monkeypatch
+    ) -> None:
+        stub_registry(monkeypatch, WIDGET_RELEASES)
+        code = main(["run", "--test", "npm test", "-C", str(node_project), "--online", "--dry-run"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "widget  1.0.0 -> 2.0.0   (2 intermediate release(s) from the registry)" in out
+        assert "excluded from the registry list:" in out
+
+    def test_versions_reads_the_npm_registry_when_asked(self, monkeypatch, capsys) -> None:
+        stub_registry(monkeypatch, WIDGET_RELEASES)
+        stub_index(monkeypatch, AssertionError("a Node package must not reach the Python index"))
+        code = main(
+            [
+                "versions",
+                "widget",
+                "--from",
+                "1.0.0",
+                "--to",
+                "2.0.0",
+                "--online",
+                "--ecosystem",
+                "node",
+            ]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert (
+            "widget: 4 candidate version(s) to bisect "
+            "(source: npm registry https://registry.npmjs.org/)"
+        ) in out
+        assert "  1.2.0  (deprecated)" in out
+        assert "Deprecated releases stay candidates" in out
+        assert "not installable on this platform (os win32)" in out
+        assert "(this platform: darwin arm64)" in out
+        assert "pre-release (--pre to include)" in out
+
+    def test_versions_without_ecosystem_still_means_the_python_index(
+        self, monkeypatch, capsys
+    ) -> None:
+        # The half of the gap this does not close. `versions` has no manifest
+        # to read, so an npm name without --ecosystem node is still looked up
+        # at PyPI, where a same-named Python project can answer.
+        stub_registry(monkeypatch, AssertionError("npm must not be asked by default"))
+        stub_index(monkeypatch, [rel("1.1.0")])
+        code = main(["versions", "brokenlib", "--from", "1.0.0", "--to", "2.0.0", "--online"])
+        assert code == 0
+        assert "source: index https://pypi.org/simple/" in capsys.readouterr().out
 
 
 class TestOnlineSession:

@@ -1,20 +1,25 @@
 """Assemble the candidate version path for one dependency.
 
-This is where the two candidate sources meet: local distribution
-directories (``--find-links``, always available, never networked) and a
-package index (``--online``, opt-in). The result is the ordered path the
-bisector will walk, plus an account of what was left out and why, so the
-report can say what was searched instead of implying it searched
-everything.
+This is where the candidate sources meet: local distribution
+directories (``--find-links``, always available, never networked) and,
+with ``--online``, the package index for a Python project or the npm
+registry for a Node one. The result is the ordered path the bisector
+will walk, plus an account of what was left out and why, so the report
+can say what was searched instead of implying it searched everything.
 
-A release is dropped for one of four reasons: it is a pre-release, it is
-yanked, its ``Requires-Python`` excludes the trial interpreter, or every
-distribution it published is a wheel tagged for some other platform. The
-first two have flags that put them back; the last two are facts about
-the machine the trials will run on.
+A Python release is dropped for one of four reasons: it is a
+pre-release, it is yanked, its ``Requires-Python`` excludes the trial
+interpreter, or every distribution it published is a wheel tagged for
+some other platform. The first two have flags that put them back; the
+last two are facts about the machine the trials will run on.
 
-Filtering applies to INDEX candidates only. A wheel sitting in a
-directory you pointed at is a version you chose deliberately, so
+An npm release is dropped for one of two: it is a semver pre-release, or
+its ``os``, ``cpu`` or ``libc`` lists rule this host out. A deprecated
+release is kept, and so is one whose ``engines`` this Node does not
+satisfy, because npm installs both; npm.py has the reasons.
+
+Filtering applies to INDEX and REGISTRY candidates only. A wheel sitting
+in a directory you pointed at is a version you chose deliberately, so
 depbisect does not second-guess it; a release the index happens to list
 is not. That also means behaviour with no ``--online`` is exactly what
 it was before index support existed.
@@ -27,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from depbisect.index import DEFAULT_INDEX_URL, IndexError_, Release, fetch_releases
+from depbisect.npm import DEFAULT_REGISTRY_URL, NpmHost, NpmRelease, fetch_npm_releases
 from depbisect.tags import Tag
 from depbisect.versions import (
     VersionParseError,
@@ -37,6 +43,7 @@ from depbisect.versions import (
 )
 
 Fetcher = Callable[..., list[Release]]
+NpmFetcher = Callable[..., list[NpmRelease]]
 
 PRE = "pre-release"
 YANKED = "yanked"
@@ -64,13 +71,19 @@ class CandidateSet:
 
     package: str
     path: list[str]
-    #: "index", "local", "index and local", or "none".
+    #: "index", "local", "index and local", or "none". For a Node project
+    #: "index" means the npm registry.
     source: str
     #: Index releases inside the interval that were filtered out, in the
     #: order the index listed them. Local candidates are never here.
     excluded_versions: tuple[Excluded, ...] = ()
     #: Set when the index was asked for and could not answer.
     note: str | None = None
+    #: "python" or "node": which kind of index the candidates came from.
+    ecosystem: str = "python"
+    #: Registry candidates on the path that npm lists as deprecated. They
+    #: are kept, and named so that keeping them is visible.
+    deprecated: tuple[str, ...] = ()
 
     @property
     def interior(self) -> int:
@@ -129,8 +142,19 @@ class CandidateSet:
             )
         if self.excluded_platform:
             where = f" ({platform})" if platform else ""
-            parts.append(f"{self.excluded_platform} with no distribution for this platform{where}")
-        return "Excluded from the index list: " + ", ".join(parts)
+            if self.ecosystem == "node":
+                parts.append(f"{self.excluded_platform} not installable on this platform{where}")
+            else:
+                parts.append(
+                    f"{self.excluded_platform} with no distribution for this platform{where}"
+                )
+        listing = "the registry list" if self.ecosystem == "node" else "the index list"
+        return f"Excluded from {listing}: " + ", ".join(parts)
+
+
+def default_index_url(ecosystem: str) -> str:
+    """Where ``--online`` looks when no ``--index-url`` is given."""
+    return DEFAULT_REGISTRY_URL if ecosystem == "node" else DEFAULT_INDEX_URL
 
 
 def build_candidates(
@@ -138,49 +162,65 @@ def build_candidates(
     good: str,
     bad: str,
     *,
+    ecosystem: str = "python",
     find_links: list[Path] | None = None,
     online: bool = False,
-    index_url: str = DEFAULT_INDEX_URL,
+    index_url: str | None = None,
     python: tuple[int, ...] = (),
     tags: frozenset[Tag] | None = None,
+    npm_host: NpmHost | None = None,
     allow_pre: bool = False,
     allow_yanked: bool = False,
     timeout: float = 30.0,
     fetch: Fetcher | None = None,
+    fetch_npm: NpmFetcher | None = None,
 ) -> CandidateSet:
     """Build the good-to-bad candidate path for one package.
 
     An index failure is never fatal here: it is recorded as a note and
     the local candidates are used instead, because half a search beats
     aborting a session that already knows which package broke.
+
+    ``python`` and ``tags`` filter a Python index listing; ``npm_host``
+    filters an npm registry listing. Each is ignored for the other.
     """
     local = local_versions(package, list(find_links or []))
     from_index: list[str] = []
     excluded: tuple[Excluded, ...] = ()
+    deprecated: frozenset[str] = frozenset()
     note: str | None = None
+    url = index_url or default_index_url(ecosystem)
 
     if online:
-        # Resolved here rather than as a default argument so the module
-        # attribute is what gets called, which is what tests replace.
-        call = fetch or fetch_releases
         try:
-            releases = call(package, index_url=index_url, timeout=timeout)
+            # Resolved here rather than as default arguments so the module
+            # attributes are what get called, which is what tests replace.
+            if ecosystem == "node":
+                from_index, excluded, deprecated = _registry_candidates(
+                    fetch_npm or fetch_npm_releases,
+                    package,
+                    good,
+                    bad,
+                    registry_url=url,
+                    timeout=timeout,
+                    host=npm_host,
+                    allow_pre=allow_pre,
+                )
+            else:
+                from_index, excluded = _index_candidates(
+                    fetch or fetch_releases,
+                    package,
+                    good,
+                    bad,
+                    index_url=url,
+                    timeout=timeout,
+                    python=python,
+                    tags=tags,
+                    allow_pre=allow_pre,
+                    allow_yanked=allow_yanked,
+                )
         except IndexError_ as exc:
             note = str(exc)
-        else:
-            # Restrict to the interval BEFORE filtering. An index lists a
-            # project's whole history, and counting exclusions over all of
-            # it would report releases that were never candidates here:
-            # "7 releases are not compatible with this interpreter" reads
-            # as a fact about this bisection, so it has to be one.
-            in_range = [r for r in releases if strictly_between(r.version, good, bad)]
-            from_index, excluded = filter_releases(
-                in_range,
-                python=python,
-                tags=tags,
-                allow_pre=allow_pre,
-                allow_yanked=allow_yanked,
-            )
 
     available = sorted(set(local) | set(from_index))
     try:
@@ -206,7 +246,56 @@ def build_candidates(
         source=source,
         excluded_versions=excluded,
         note=note,
+        ecosystem=ecosystem,
+        deprecated=tuple(version for version in path[1:-1] if version in deprecated),
     )
+
+
+def _index_candidates(
+    fetch: Fetcher,
+    package: str,
+    good: str,
+    bad: str,
+    *,
+    index_url: str,
+    timeout: float,
+    python: tuple[int, ...],
+    tags: frozenset[Tag] | None,
+    allow_pre: bool,
+    allow_yanked: bool,
+) -> tuple[list[str], tuple[Excluded, ...]]:
+    releases = fetch(package, index_url=index_url, timeout=timeout)
+    # Restrict to the interval BEFORE filtering. An index lists a
+    # project's whole history, and counting exclusions over all of it
+    # would report releases that were never candidates here: "7 releases
+    # are not compatible with this interpreter" reads as a fact about
+    # this bisection, so it has to be one.
+    in_range = [r for r in releases if strictly_between(r.version, good, bad)]
+    return filter_releases(
+        in_range,
+        python=python,
+        tags=tags,
+        allow_pre=allow_pre,
+        allow_yanked=allow_yanked,
+    )
+
+
+def _registry_candidates(
+    fetch: NpmFetcher,
+    package: str,
+    good: str,
+    bad: str,
+    *,
+    registry_url: str,
+    timeout: float,
+    host: NpmHost | None,
+    allow_pre: bool,
+) -> tuple[list[str], tuple[Excluded, ...], frozenset[str]]:
+    releases = fetch(package, registry_url=registry_url, timeout=timeout)
+    # The same interval-first rule as the Python index, for the same reason.
+    in_range = [r for r in releases if strictly_between(r.version, good, bad)]
+    kept, excluded = filter_npm_releases(in_range, host=host, allow_pre=allow_pre)
+    return kept, excluded, frozenset(r.version for r in in_range if r.deprecated)
 
 
 def filter_releases(
@@ -254,6 +343,36 @@ def filter_releases(
     return kept, tuple(excluded)
 
 
+def filter_npm_releases(
+    releases: list[NpmRelease],
+    *,
+    host: NpmHost | None = None,
+    allow_pre: bool = False,
+) -> tuple[list[str], tuple[Excluded, ...]]:
+    """Drop npm releases a bisection should not spend a test run on.
+
+    ``host`` None means Node could not be asked, and then nothing is
+    dropped on platform, exactly as an undescribable Python host drops
+    nothing on wheel tags.
+    """
+    kept: list[str] = []
+    excluded: list[Excluded] = []
+    for release in releases:
+        if not allow_pre and _is_semver_prerelease(release.version):
+            excluded.append(Excluded(release.version, PRE, "pre-release (--pre to include)"))
+        elif host is not None and not release.installable_on(host):
+            excluded.append(
+                Excluded(
+                    release.version,
+                    PLATFORM,
+                    f"not installable on this platform ({release.platform_requirements()})",
+                )
+            )
+        else:
+            kept.append(release.version)
+    return kept, tuple(excluded)
+
+
 def _requires(release: Release) -> str:
     """The Requires-Python values a release declared, for a message."""
     stated = [spec for spec in release.requires_python if spec]
@@ -265,3 +384,13 @@ def _is_prerelease(text: str) -> bool:
         return parse_version(text).phase_rank < 0
     except VersionParseError:
         return False
+
+
+def _is_semver_prerelease(text: str) -> bool:
+    """Semver's rule rather than PEP 440's: a hyphen before any build metadata.
+
+    The two disagree. PEP 440 reads ``2.0.0-post.1`` as a post-release,
+    newer than 2.0.0; semver reads it as a pre-release of 2.0.0, and npm
+    does not pick it for a plain range.
+    """
+    return "-" in text.split("+", 1)[0]
